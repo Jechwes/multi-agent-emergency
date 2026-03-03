@@ -1,19 +1,22 @@
 import argparse
 import time
+import os
+import sys
 try:
-    import numpy as np # Fixed typo 'as py'
-    import sys
-
-    from os import path as osp
+    import numpy as np
 except ImportError:
     raise RuntimeError('import error!')
 
 from queue import Empty
 from scenarios.roundabout import *
 import control.vehicle_model as model
-from control.trackingMPC import MPC_controller 
+from control.trackingMPC import MPC_controller
 from perception.grid_polar import Griding
 import math
+
+# Allow imports from siblings when run directly
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from abstraction.frenet_lanelet import Lanelet, LaneletMap
 
 def main():
     argparser = argparse.ArgumentParser(description='Carla ArgParser practice')
@@ -35,7 +38,7 @@ def main():
         transform = spectator.get_transform()
         spectator.set_transform(carla.Transform(carla.Location(z=50), carla.Rotation(pitch=-90))) 
 
-        # -------------- Grid -----------------
+        # -------------- Polar grid (existing) -----------------
         origin = carla.Location(x=-0.5, y=0.5, z=0.2)
         # specific_angle_step e.g. 10 degrees
         grid = Griding(env.world, origin, lane_start=13.5, lane_amount=4, cell_width=4, angle_step=12)
@@ -43,7 +46,57 @@ def main():
         grid.draw_grid_map_polar(grid_time)
 
         # Highlight a specific cell at [ring_idx, sector_idx, num_rings, num_sectors]
-        grid.draw_box([3, 16, 1, 1], grid_time) 
+        grid.draw_box([3, 16, 1, 1], grid_time)
+
+        # -------------- Frenet lanelet overlay -----------------
+        # Parameters must match the polar grid above
+        org_x      = origin.x          # -0.5
+        org_y      = origin.y          #  0.5
+        lane_start = 13.5              # inner radius of ring 0 [m]
+        cell_width = 4.0               # radial width per ring  [m]
+        lane_amount = 4                # number of rings
+        n_circ     = 120               # waypoints per full circle (finer = smoother spline)
+
+        # Build one circular Lanelet per ring.
+        # The centre-line of ring i sits at radius = lane_start + (i + 0.5) * cell_width.
+        angles = np.linspace(0, 2 * np.pi, n_circ, endpoint=False)
+        waypoint_lists = []
+        ring_radii = []
+        for i in range(lane_amount):
+            r = lane_start + (i + 0.5) * cell_width   # ring centre radius
+            ring_radii.append(r)
+            wps = np.column_stack([
+                org_x + r * np.cos(angles),
+                org_y + r * np.sin(angles),
+            ])
+            # Close the loop so the spline wraps smoothly
+            wps = np.vstack([wps, wps[0]])
+            waypoint_lists.append(wps)
+
+        # chain_s=False: each ring is an independent lanelet (parallel, not sequential)
+        lmap = LaneletMap.from_waypoint_lists(
+            waypoint_lists,
+            lane_widths=[cell_width] * lane_amount,
+            chain_s=False,
+        )
+
+        # Draw: centre-lines + lane boundaries + transverse s-grid lines.
+        # s_grid_step matches your Frenet MDPModel grid resolution (here same as cell_width).
+        lmap.draw_in_carla(
+            env.world,
+            z=origin.z + 0.15,       # draw slightly above polar grid
+            n_samples=300,
+            s_grid_step=cell_width,  # transverse line every 4 m along arc
+            life_time=grid_time,
+        )
+
+        print(f"Frenet LaneletMap drawn: {lmap}")
+        print(f"  Ring radii: {ring_radii}")
+        for lane in lmap.lanelets:
+            lb, ub = lane.s_bounds()
+            print(f"  Lane {lane.lane_id}: circumference = {lane.length:.1f} m"
+                  f",  s ∈ [{lb:.1f}, {ub:.1f}]"
+                  f",  κ_max = {max(abs(lane.curvature(s)) for s in np.linspace(0, lane.length, 50)):.4f} 1/m")
 
 
     finally:
