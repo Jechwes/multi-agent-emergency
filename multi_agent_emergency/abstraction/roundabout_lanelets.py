@@ -437,6 +437,109 @@ class RoundaboutLaneletMap:
         return sl.to_cartesian(s, d)
 
     # ------------------------------------------------------------------
+    # Multi-lane Frenet conversion (global d across all lanes)
+    # ------------------------------------------------------------------
+
+    def to_frenet_multilane(
+        self,
+        xy: np.ndarray,
+        speed: Optional[float] = None,
+        yaw: Optional[float] = None,
+        ref_lane: int = 1,
+    ) -> Tuple[int, int, 'FrenetState']:
+        """
+        Convert world (x, y) to (section_id, lane_id, FrenetState)
+        where ``d`` is the **global** lateral offset from the reference
+        point between drivable lanes 1 and 2.
+
+        The reference radius is::
+
+            r_ref = inner_radius + (n_lanes / 2) * lane_width
+
+        and ``d_global = r_car − r_ref``  (positive = outward).
+
+        ``s`` is computed on *ref_lane* (default: lane 1).
+
+        Parameters
+        ----------
+        xy       : (2,) world position.
+        speed    : vehicle speed for velocity decomposition.
+        yaw      : vehicle heading [rad].
+        ref_lane : lane used for the s-axis projection (default 1).
+
+        Returns
+        -------
+        section_id : int
+        lane_id    : int  (actual lane the car is closest to)
+        frenet     : FrenetState  with d = d_global, s from ref_lane.
+        """
+        xy = np.asarray(xy, dtype=float).ravel()[:2]
+        sec = self._identify_section(xy)
+        lane = self._identify_lane(xy)
+
+        # Use the reference lane's lanelet for the s-axis projection
+        sl_ref = self.sections[sec][ref_lane]
+        fs_local = sl_ref.to_frenet(xy, speed=speed, yaw=yaw)
+
+        # Compute d_global from radial distance
+        r_ref = self.inner_radius + (self.n_lanes / 2.0) * self.lane_width
+        r_car = self._radius_of(xy)
+        d_global = r_car - r_ref
+
+        fs = FrenetState(
+            s=fs_local.s,
+            d=d_global,
+            s_dot=fs_local.s_dot,
+            d_dot=fs_local.d_dot,
+        )
+        return sec, lane, fs
+
+    def to_cartesian_multilane(
+        self,
+        section_id: int,
+        s: float,
+        d_global: float,
+        ref_lane: int = 1,
+    ) -> 'CartesianState':
+        """
+        Convert multi-lane Frenet (s, d_global) to world Cartesian.
+
+        ``s`` is the arc-length on *ref_lane*.
+        ``d_global`` is the lateral offset from the reference midpoint
+        between lanes 1 and 2 (positive = outward).
+
+        The method projects the (s, d_global) pair back through the
+        ref_lane's spline, then offsets in the normal direction.
+        """
+        sl_ref = self.sections[section_id][ref_lane]
+        s_clip = float(np.clip(s, 0.0, sl_ref.arc_length))
+
+        # Reference point on the ref_lane centre-line
+        cx = float(sl_ref._spline_x(s_clip))
+        cy = float(sl_ref._spline_y(s_clip))
+        heading = sl_ref.tangent_angle(s_clip)
+
+        # Normal direction (positive d = outward from roundabout centre)
+        nx = -math.sin(heading)
+        ny = math.cos(heading)
+
+        # The ref_lane centre is at r_ref_lane
+        r_ref_lane = self.inner_radius + (ref_lane + 0.5) * self.lane_width
+        # Global d=0 reference is at r_ref
+        r_ref = self.inner_radius + (self.n_lanes / 2.0) * self.lane_width
+        # Lateral offset from ref_lane centre → global reference
+        d_offset = r_ref - r_ref_lane   # e.g. +2.0 m for ref_lane=1
+
+        # Total lateral offset from the ref_lane centre-line
+        d_total = d_offset + d_global
+
+        return CartesianState(
+            x=cx + d_total * nx,
+            y=cy + d_total * ny,
+            heading=heading,
+        )
+
+    # ------------------------------------------------------------------
     # Transition helpers for MDP
     # ------------------------------------------------------------------
 

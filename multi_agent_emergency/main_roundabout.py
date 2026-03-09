@@ -35,6 +35,7 @@ Multi-agent behaviour will be added later.
 import argparse
 import time
 import math
+from typing import Optional
 
 import numpy as np
 import sys
@@ -69,6 +70,7 @@ from abstraction.roundabout_lanelets import RoundaboutLaneletMap
 # Decoupled abstraction + helpers
 from abstraction.roundabout_abstraction import (
     build_roundabout_abstraction,
+    build_pedestrian_chain,
     SysAbs1D,
     build_label_matrices,
 )
@@ -76,6 +78,7 @@ from abstraction.roundabout_abstraction import (
 # DFA tree risk-minimisation solver
 from decision.specification.roundabout_dfa import RoundaboutDFA
 from decision.maker_roundabout_dp import RoundaboutDPDecisionMaker
+from decision.safety_filter import SafetyFilter, RiskLevel
 
 
 # ---------------------------------------------------------------------------
@@ -88,19 +91,20 @@ def build_mpc_reference(
     s0: float,
     d0: float,
     section: int,
-    lane: int,
+    ref_lane: int,
     mpc_dt: float,
     mpc_horizon: int,
-    lane_width: float,
+    d_ref: float = 0.0,
 ) -> np.ndarray:
     """
     Roll out the DP policy at MPC resolution and convert each
-    Frenet waypoint to Cartesian.
+    Frenet waypoint to Cartesian using the multi-lane reference.
 
     Parameters
     ----------
     action_fn : callable(s, d) -> (v_s, v_d)
         Policy query returning longitudinal and lateral speed.
+    ref_lane  : reference lane for the s-axis (typically 1).
 
     Returns
     -------
@@ -111,26 +115,31 @@ def build_mpc_reference(
     s, d = s0, d0
     sec = section
 
+    sl_ref = rmap.get_section_lanelet(sec, ref_lane)
+
     for k in range(mpc_horizon):
         v_s, v_d = action_fn(s, d)
 
         s += v_s * mpc_dt
         d += v_d * mpc_dt
 
-        # Handle section wrap
-        sl = rmap.get_section_lanelet(sec, lane)
-        while s >= sl.arc_length:
-            s -= sl.arc_length
+        # Handle section wrap using the ref_lane's arc length
+        while s >= sl_ref.arc_length:
+            s -= sl_ref.arc_length
             sec = rmap.next_section(sec)
-            sl = rmap.get_section_lanelet(sec, lane)
+            sl_ref = rmap.get_section_lanelet(sec, ref_lane)
         while s < 0:
             sec = rmap.prev_section(sec)
-            sl = rmap.get_section_lanelet(sec, lane)
-            s += sl.arc_length
+            sl_ref = rmap.get_section_lanelet(sec, ref_lane)
+            s += sl_ref.arc_length
 
-        # Convert to Cartesian — force d=0 so the reference stays on
-        # the lane centre-line (the MPC steers to track this).
-        cart = rmap.to_cartesian(sec, lane, s, 0.0)
+        # Clamp d to span
+        lateral_half = (rmap.n_lanes / 2.0) * rmap.lane_width
+        d = float(np.clip(d, -lateral_half, lateral_half))
+
+        # Convert to Cartesian via the multilane helper.
+        # d_ref selects the target lane centre (e.g. ±2.0 m for lanes 1/2).
+        cart = rmap.to_cartesian_multilane(sec, s, d_ref, ref_lane=ref_lane)
         ref[0, k] = cart.x
         ref[1, k] = cart.y
         ref[2, k] = max(abs(v_s), 1.0)     # desired speed (≥1 m/s)
@@ -159,19 +168,25 @@ def main():
     LANE_WIDTH    = 4.0              # [m]
     N_LANES       = 4                # concentric rings
     N_SECTIONS    = 12               # angular sectors (30° each)
-    DRIVE_LANE    = 2                # drivable lane (0 = island, 3 = outer boundary)
+    REF_LANE      = 1                # reference lane for the s-axis
+    DRIVE_LANE    = 2                # lane the car drives in (1 = inner, 2 = outer drivable)
     DIRECTION     = "cw"             # CW in maths ⇒ CCW visually in CARLA
 
     # DP grid resolution
     N_S = 10                         # longitudinal cells per section
-    N_D = 5                         # lateral cells per lane
+    N_D = 16                         # lateral cells across all 4 lanes
     V_S_MAX = 10.0                   # max longitudinal speed [m/s]
     V_D_MAX = 2.0                    # max lateral speed [m/s]
     N_SPEED_S = 5                    # number of longitudinal speed actions
     N_SPEED_D = 5                    # number of lateral speed actions
 
+    # Pedestrian dimension
+    N_P    = 8                       # pedestrian lateral grid cells
+    P_MOVE = 0.3                     # per-step crossing probability
+    PED_PENALTY = 50.0               # cost when pedestrian is on the road
+
     DT_DP  = 0.05                     # DP abstraction time step [s]
-    GAMMA  = 0.95                    # discount factor
+    GAMMA  = 0.5                    # discount factor
 
     # Cost-map tuning knobs
     K_SPEED       = 0.5              # reward scale for forward speed
@@ -183,6 +198,13 @@ def main():
     N_TREE_ITERS  = 3                # outer iterations (grow + policy + VI)
     N_GROW        = 2                # tree expansions per outer iteration
     N_VI_PER_ITER = 10               # value-iteration sweeps per outer iteration
+
+    # Safety filter thresholds
+    #   Risk scale: lateral risk 0/50, pedestrian Bellman 0..~80
+    #   Combined risk = risk_d + risk_p
+    SF_WARN_THRESH  = 40.0           # risk above this → reduce speed (CAUTION)
+    SF_BRAKE_THRESH = 75.0           # risk above this → full brake (BRAKE)
+    SF_CAUTION_FACTOR = 0.5          # speed multiplier during CAUTION
 
     try:
         # =================================================================
@@ -199,17 +221,20 @@ def main():
         )
         print(rmap.summary())
 
-        # Reference arc length for one section in DRIVE_LANE
-        section_L = rmap.section_arc_length(DRIVE_LANE)
-        print(f"Reference section arc length (lane {DRIVE_LANE}): {section_L:.2f} m")
+        # Reference arc length for one section on the REF_LANE
+        section_L = rmap.section_arc_length(REF_LANE)
+        print(f"Reference section arc length (lane {REF_LANE}): {section_L:.2f} m")
+
+        # Lateral offset for the chosen DRIVE_LANE centre:
+        #   lane 1 → d = -lane_width/2,  lane 2 → d = +lane_width/2
+        D_REF = (DRIVE_LANE - 1.5) * LANE_WIDTH
 
         # Compute spawn pose from the lanelet map
-        # Use _identify_section to find what section the original spawn
-        # point falls into under the current direction convention.
         _orig_spawn = np.array([-2.1, 20.2])
         start_section = rmap._identify_section(_orig_spawn)
-        cart_start = rmap.to_cartesian(start_section, DRIVE_LANE,
-                                        0.5 * section_L, 0.0)
+        cart_start = rmap.to_cartesian_multilane(
+            start_section, 0.5 * section_L, D_REF, ref_lane=REF_LANE,
+        )
         ego_sp = carla.Transform(
             carla.Location(x=cart_start.x, y=cart_start.y, z=0.3),
             carla.Rotation(yaw=math.degrees(cart_start.heading)),
@@ -232,6 +257,22 @@ def main():
 
         origin = carla.Location(x=CENTRE[0], y=CENTRE[1], z=0.2)
 
+        # --- Spawn pedestrian on the outer lane (lane 3) ---
+        # Place the pedestrian at a fixed angular position (section 6,
+        # opposite to the ego spawn) on the outer edge of the roundabout.
+        PED_SECTION = (start_section + 6) % N_SECTIONS
+        r_ped_spawn = INNER_RADIUS + N_LANES * LANE_WIDTH   # outer edge of lane 3
+        ped_angle = -(PED_SECTION + 0.5) * (2 * math.pi / N_SECTIONS)  # CW
+        ped_x = CENTRE[0] + r_ped_spawn * math.cos(ped_angle)
+        ped_y = CENTRE[1] + r_ped_spawn * math.sin(ped_angle)
+        env.spawn_pedestrian(
+            spawn_location=carla.Location(x=ped_x, y=ped_y, z=0.5),
+            speed=1.2,   # slow walk
+        )
+        # Patrol boundaries: lane 1 centre ↔ outer edge of lane 3
+        PED_R_INNER = INNER_RADIUS + 1.75 * LANE_WIDTH          # 19.5 m (lane 1 centre)
+        PED_R_OUTER = INNER_RADIUS + N_LANES * LANE_WIDTH      # 29.5 m (lane 3 outer edge)
+
         # =================================================================
         #  3. VEHICLE MODEL + MPC CONTROLLER
         # =================================================================
@@ -252,6 +293,7 @@ def main():
         abs_data = build_roundabout_abstraction(
             section_arc_length=section_L,
             lane_width=LANE_WIDTH,
+            n_lanes=N_LANES,
             dt=DT_DP,
             N_s=N_S,
             N_d=N_D,
@@ -265,6 +307,16 @@ def main():
             edge_penalty=EDGE_PENALTY,
         )
 
+        # ---- Pedestrian Markov chain (3rd dimension) ----
+        ped_data = build_pedestrian_chain(
+            N_p=N_P,
+            lane_width=LANE_WIDTH,
+            n_lanes=N_LANES,
+            p_move=P_MOVE,
+            n_letters=3,
+            ped_on_road_penalty=PED_PENALTY,
+        )
+
         # =================================================================
         #  5. DFA SPECIFICATION + TREE SOLVER
         # =================================================================
@@ -273,36 +325,55 @@ def main():
 
         # Wrap transition matrices for DFATree compatibility
         sysAbs = [
-            SysAbs1D(abs_data['P_s']),    # longitudinal
-            SysAbs1D(abs_data['P_d']),    # lateral
+            SysAbs1D(abs_data['P_s']),          # dim 0: longitudinal
+            SysAbs1D(abs_data['P_d']),          # dim 1: lateral (all lanes)
+            SysAbs1D(ped_data['P_p']),          # dim 2: pedestrian (Markov)
         ]
 
         # Per-dimension label matrices  (n_letters × N)
-        L_s, L_d = build_label_matrices(N_S, N_D, n_letters=dfa.n_letters,
-                                         edge_cells=1)
+        L_s, L_d = build_label_matrices(
+            N_S, N_D,
+            centres_d=abs_data['centres_d'],
+            lane_width=LANE_WIDTH,
+            n_letters=dfa.n_letters,
+        )
+        L_p = ped_data['L_p']
 
         # Initial policy: None → DFATree starts with uniform
+        D = 3  # number of decoupled dimensions
         n_dfa_states = dfa.n_states
-        pol_init = np.empty((n_dfa_states, 2), dtype=object)
+        pol_init = np.empty((n_dfa_states, D), dtype=object)
         for q in range(n_dfa_states):
-            for d_idx in range(2):
-                pol_init[q][d_idx] = None
+            for dim in range(D):
+                pol_init[q][dim] = None
 
         # Uniform initial state distribution per dimension
         rho = [
             np.ones(N_S, dtype=float) / N_S,
             np.ones(N_D, dtype=float) / N_D,
+            ped_data['rho_p'],                   # pedestrian starts on lane 3
         ]
 
         # Cost maps for the tree (state costs from the abstraction)
-        cost_map = [abs_data['state_cost_s'], abs_data['state_cost_d']]
+        cost_map = [
+            abs_data['state_cost_s'],
+            abs_data['state_cost_d'],
+            ped_data['cost_p'],
+        ]
+
+        # Per-action costs (None for the uncontrolled pedestrian dim)
+        action_cost_list = [
+            abs_data['action_cost_s'],
+            abs_data['action_cost_d'],
+            None,
+        ]
 
         # Build and solve DFA tree
         maker = RoundaboutDPDecisionMaker(
             dfa=dfa,
             sysAbs=sysAbs,
-            nx_list=[N_S, N_D],
-            L=[L_s, L_d],
+            nx_list=[N_S, N_D, N_P],
+            L=[L_s, L_d, L_p],
             pol=pol_init,
             rho=rho,
             cost_map=cost_map,
@@ -314,17 +385,73 @@ def main():
             n_vi_per_iter=N_VI_PER_ITER,
             n_grow=N_GROW,
             gamma=GAMMA,
-            action_cost=[abs_data['action_cost_s'],
-                         abs_data['action_cost_d']],
+            action_cost=action_cost_list,
+            centres_p=ped_data['centres_p'],
         )
 
         # Convenience: create a simple (s, d) → (v_s, v_d) callable
         def dp_action(s: float, d: float):
-            v_s, v_d, _ = maker.get_action(s, d, 0, DRIVE_LANE)
+            v_s, v_d, _ = maker.get_action(s, d, 0, REF_LANE)
             return v_s, v_d
 
         # =================================================================
-        #  6. MAIN SIMULATION LOOP
+        #  6. SAFETY FILTER  (monitors risk value function)
+        # =================================================================
+        safety_filter = SafetyFilter(
+            maker=maker,
+            warn_thresh=SF_WARN_THRESH,
+            brake_thresh=SF_BRAKE_THRESH,
+            caution_speed_factor=SF_CAUTION_FACTOR,
+        )
+        print(f"\n[SafetyFilter] Initialised  "
+              f"(warn={SF_WARN_THRESH}, brake={SF_BRAKE_THRESH})")
+
+        # Helper: get pedestrian lateral coordinate + angular proximity
+        #   Only returns the pedestrian's d when the ped is AHEAD of the
+        #   ego car (in the CW driving direction).  Returns None when the
+        #   ped is behind the car or too far around the roundabout.
+        PED_ANGLE_AHEAD = math.radians(45)   # look-ahead cone (in driving dir)
+        PED_ANGLE_BEHIND = math.radians(8)   # tiny rear margin (just passed)
+
+        def _get_ped_lateral(ego_xy: np.ndarray) -> Optional[float]:
+            """
+            Return the pedestrian's lateral coordinate (d) relative to
+            the roundabout reference lane, **only** when the pedestrian
+            is ahead of the ego car in the driving direction.
+
+            Returns None when no pedestrian exists or when the pedestrian
+            is behind / far around the roundabout.
+            """
+            if env.pedestrian is None:
+                return None
+            loc = env.pedestrian.get_location()
+            dx_p = loc.x - CENTRE[0]
+            dy_p = loc.y - CENTRE[1]
+            r_ped = math.sqrt(dx_p * dx_p + dy_p * dy_p)
+
+            # Signed angular offset: ped relative to ego
+            dx_e = ego_xy[0] - CENTRE[0]
+            dy_e = ego_xy[1] - CENTRE[1]
+            ang_ped = math.atan2(dy_p, dx_p)
+            ang_ego = math.atan2(dy_e, dx_e)
+            signed_ang = math.atan2(
+                math.sin(ang_ped - ang_ego),
+                math.cos(ang_ped - ang_ego),
+            )  # negative = ped is ahead (CW), positive = ped is behind
+
+            # CW direction: ped ahead → signed_ang < 0
+            # Allow a small positive margin for "just passing" the ped
+            if signed_ang < -PED_ANGLE_AHEAD:
+                return None          # ped is too far ahead
+            if signed_ang > PED_ANGLE_BEHIND:
+                return None          # ped is behind the car
+
+            # d_ped in the same lateral frame as the ego d
+            r_ref = INNER_RADIUS + (REF_LANE + 0.5) * LANE_WIDTH
+            return r_ped - r_ref
+
+        # =================================================================
+        #  7. MAIN SIMULATION LOOP
         # =================================================================
         print("\n========== Starting simulation loop ==========\n")
         step = 0
@@ -334,54 +461,101 @@ def main():
             env.world.tick()
             car_model.update()
 
+            # --- Update pedestrian patrol (outer ↔ inner lane) ---
+            env.update_pedestrian_patrol(
+                centre=CENTRE,
+                inner_radius=PED_R_INNER,
+                outer_radius=PED_R_OUTER,
+                section_angle=2 * math.pi / N_SECTIONS,
+            )
+
             # --- Ego world state ---
             ego_xy = np.array([car_model.x, car_model.y])
             ego_v  = car_model.v
             ego_yaw = car_model.yaw
 
-            # --- Map to Frenet coordinates via lanelet map ---
-            sec_id, lane_id, frenet = rmap.to_frenet(ego_xy, speed=ego_v, yaw=ego_yaw)
+            # --- Map to Frenet coordinates via lanelet map (multilane) ---
+            sec_id, lane_id, frenet = rmap.to_frenet_multilane(
+                ego_xy, speed=ego_v, yaw=ego_yaw, ref_lane=REF_LANE,
+            )
             s_ego = frenet.s
             d_ego = frenet.d
 
             # --- Query DP policy ---
             v_s, v_d = dp_action(s_ego, d_ego)
 
+            # --- Pedestrian lateral position for risk evaluation ---
+            #     Only non-None when ped is angularly close to ego
+            p_lat = _get_ped_lateral(ego_xy)
+
+            # --- Safety filter evaluation ---
+            risk_level, risk_total, risk_comp = safety_filter.evaluate(
+                s_ego, d_ego, p_lat,
+            )
+
+            # --- Apply safety filter: adjust speed + lateral reference ---
+            v_s_safe = safety_filter.filter_speed(v_s, risk_level)
+            d_ref_safe = safety_filter.suggest_d_ref(
+                D_REF, risk_level, p_lat,
+            )
+
+            # Override dp_action for MPC reference with filtered speed
+            def dp_action_filtered(s: float, d: float):
+                _, v_d_nom = dp_action(s, d)
+                return v_s_safe, v_d_nom
+
             # --- Build MPC reference trajectory ---
             ref_traj = build_mpc_reference(
-                action_fn=dp_action,
+                action_fn=dp_action_filtered,
                 rmap=rmap,
                 s0=s_ego, d0=d_ego,
-                section=sec_id, lane=DRIVE_LANE,
+                section=sec_id, ref_lane=REF_LANE,
                 mpc_dt=MPC_DT,
                 mpc_horizon=MPC_HORIZON,
-                lane_width=LANE_WIDTH,
+                d_ref=d_ref_safe,
             )
 
             # --- MPC tracking ---
             try:
                 control_cmd = ego_controller.solve_trajectory(ref_traj)
+                # During BRAKE: add explicit braking on top of MPC
+                if risk_level == RiskLevel.BRAKE:
+                    control_cmd.throttle = 0.0
+                    control_cmd.brake = 1.0
                 env.ego_car.apply_control(control_cmd)
             except Exception as e:
                 # Fallback: single-point tracking
                 try:
                     target_point = (ref_traj[0, 0], ref_traj[1, 0], ref_traj[3, 0])
-                    control_cmd = ego_controller.solve(target_point, max(v_s, 1.0))
+                    speed = max(v_s_safe, 0.5)
+                    control_cmd = ego_controller.solve(target_point, speed)
+                    if risk_level == RiskLevel.BRAKE:
+                        control_cmd.throttle = 0.0
+                        control_cmd.brake = 1.0
                     env.ego_car.apply_control(control_cmd)
                 except Exception as e2:
                     if step % 50 == 0:
                         print(f"[Step {step}] MPC Error: {e2}")
-                    env.ego_car.apply_control(carla.VehicleControl(brake=0.0, throttle=0.3))
+                    if risk_level == RiskLevel.BRAKE:
+                        env.ego_car.apply_control(carla.VehicleControl(brake=1.0, throttle=0.0))
+                    else:
+                        env.ego_car.apply_control(carla.VehicleControl(brake=0.0, throttle=0.3))
 
             # --- Periodic logging ---
             if step % 100 == 0:
+                sf_tag = risk_level.name
                 print(
                     f"[Step {step}] "
                     f"sec={sec_id}, lane={lane_id}, "
                     f"s={s_ego:.2f}, d={d_ego:.2f}, "
-                    f"v_s={v_s:.1f}, v_d={v_d:.2f}, "
-                    f"ego_v={ego_v:.1f} m/s"
+                    f"v_s={v_s:.1f}→{v_s_safe:.1f}, v_d={v_d:.2f}, "
+                    f"ego_v={ego_v:.1f} m/s  "
+                    f"| SF:{sf_tag} risk={risk_total:.1f} "
+                    f"(d={risk_comp['d']:.1f} p={risk_comp['p']:.1f})"
                 )
+            # Log every tick when filter is intervening
+            elif risk_level != RiskLevel.NOMINAL and step % 10 == 0:
+                print(safety_filter.summary_line(risk_level, risk_total, risk_comp))
 
     finally:
         if env is not None:

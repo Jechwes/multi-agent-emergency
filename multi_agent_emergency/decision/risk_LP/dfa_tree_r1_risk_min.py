@@ -324,12 +324,13 @@ class DFATree:
         l = int(self.tree.edges[p, n]["l"])  # 0-based label column
         q = self.Lq(n)                        # DFA mode at node n (0-based)
 
-        # skip accepting / sink states
-        skip = {int(self.DFA.F)}
+        # Only skip the absorbing sink state.
+        # The accepting state (F) IS the operating state in the safety-
+        # filter DFA, so it must NOT be skipped.  The root node (n=0)
+        # is already guarded above.
         if hasattr(self.DFA, "sink") and getattr(self.DFA, "sink") is not None:
-            skip.add(int(self.DFA.sink))
-        if q in skip:
-            return
+            if q == int(self.DFA.sink):
+                return
 
         for d in range(self.dim):
             v_parent = self.V[d][p, :]
@@ -543,8 +544,10 @@ class DFATree:
         num_states = len(self.DFA.S)
         new_pol = np.empty((num_states, self.dim), dtype=object)
 
-        # states to skip (final/sink)
-        skip = {int(self.DFA.F)}
+        # Only skip the absorbing sink state.
+        # The accepting state F is the operating state in the safety-
+        # filter DFA and MUST have a policy computed for it.
+        skip = set()
         if hasattr(self.DFA, "sink") and getattr(self.DFA, "sink") is not None:
             skip.add(int(self.DFA.sink))
 
@@ -641,7 +644,8 @@ class DFATree:
                 # Adding it biases the policy toward lower-cost actions
                 # (e.g. negative cost for forward speed → prefer driving).
                 if hasattr(self, 'action_cost') and self.action_cost is not None:
-                    Vxa[d] = Vxa[d] + self.action_cost[d]  # broadcast (N, nu) += (nu,)
+                    if self.action_cost[d] is not None:
+                        Vxa[d] = Vxa[d] + self.action_cost[d]  # broadcast (N, nu) += (nu,)
 
                 #I = np.argmax(Vxa[d], axis=1)  # best action per abstract state
                 I = np.argmin(Vxa[d], axis=1)
@@ -960,8 +964,8 @@ class DFATree:
             lo[d] = lo_d
             hi[d] = hi_d
 
-        # -------- gather candidate nodes (non-accepting, non-sink DFA states) --------
-        skip_states = {int(self.DFA.F)}
+        # -------- gather candidate nodes (skip only sink state) --------
+        skip_states = set()
         if hasattr(self.DFA, "sink") and getattr(self.DFA, "sink") is not None:
             skip_states.add(int(self.DFA.sink))
 

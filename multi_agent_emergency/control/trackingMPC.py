@@ -79,7 +79,8 @@ class MPC_controller:
         self.opti.subject_to(self.X[:, 0] == self.X_0)  # initial condition
         # Solver configuration
         self.opti.minimize(cost)
-        opts = {'ipopt': {'print_level': 0}}
+        # TO ENABLE SOLVER OUTPUT: change print_level to 5 and print_time to True
+        opts = {'ipopt': {'print_level': 0}, 'print_time': False}
         self.opti.solver('ipopt', opts)
 
     def solve_2(self, ref_x, ref_y, ref_yaw, sp_coe):
@@ -92,7 +93,8 @@ class MPC_controller:
 
         opt_states = sol.value(self.X)
         opt_inputs = sol.value(self.U)
-        print("opt_inputs", opt_inputs[:, 1])
+        # TO ENABLE SOLVER OUTPUT: uncomment the line below
+        # print("opt_inputs", opt_inputs[:, 1])
         return self.gen_cmd(opt_inputs[0, 1], opt_inputs[1, 1])
 
     def solve(self, target, des_speed):
@@ -105,7 +107,8 @@ class MPC_controller:
 
         opt_states = sol.value(self.X)
         opt_inputs = sol.value(self.U)
-        print("opt_inputs", opt_inputs[:, 1])
+        # TO ENABLE SOLVER OUTPUT: uncomment the line below
+        # print("opt_inputs", opt_inputs[:, 1])
         return self.gen_cmd(opt_inputs[0, 1], opt_inputs[1, 1])
 
     def gen_cmd(self, acc_cmd, delta_cmd):

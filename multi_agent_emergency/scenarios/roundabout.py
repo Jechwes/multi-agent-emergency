@@ -1,5 +1,6 @@
 import carla
 import random
+import math
 import numpy as np
 from queue import Queue
 import weakref
@@ -49,22 +50,133 @@ class Environment:
 
         self.zombie_cars = []
 
+        # -------------- Pedestrian (walker) settings -------------- #
+        self.pedestrian = None
+        self.ped_controller = None
+
     # Function to add cars
     def add_car(self, spawn_point, color):
         model3_bp = self.world.get_blueprint_library().find('vehicle.tesla.model3')
         model3_bp.set_attribute('color', color)
         car = self.world.spawn_actor(model3_bp, spawn_point)
-
-        # PORT BUSY? WTF HAPPENS HERE?
-        # try:
-        #     car.set_autopilot(True) 
-        # except RuntimeError:
-        #     # Fallback or just print
-        #     print("Failed to set autopilot, TM port might be busy.")
-         
         return car
 
+    # ------------------------------------------------------------------
+    # Pedestrian (walker) spawning
+    # ------------------------------------------------------------------
+
+    def spawn_pedestrian(
+        self,
+        spawn_location: carla.Location,
+        direction: carla.Vector3D = None,
+        speed: float = 1.4,
+    ):
+        """
+        Spawn a CARLA walker at *spawn_location* and start it walking in
+        *direction* at *speed* [m/s].  The walker + controller are stored
+        on ``self.pedestrian`` / ``self.ped_controller``.
+
+        Parameters
+        ----------
+        spawn_location : carla.Location
+            World position for the pedestrian.
+        direction      : carla.Vector3D, optional
+            Initial walking direction (unit vector).  Defaults to (1, 0, 0).
+        speed          : float
+            Walking speed [m/s]  (default 1.4 ≈ normal walk).
+        """
+        bp_lib = self.world.get_blueprint_library()
+        walker_bps = bp_lib.filter('walker.pedestrian.*')
+        walker_bp = random.choice(walker_bps)
+
+        # Make the walker invincible so it doesn't ragdoll on collision
+        if walker_bp.has_attribute('is_invincible'):
+            walker_bp.set_attribute('is_invincible', 'true')
+
+        spawn_tf = carla.Transform(spawn_location)
+        self.pedestrian = self.world.spawn_actor(walker_bp, spawn_tf)
+
+        # Attach an AI controller (required for apply_control)
+        ctrl_bp = bp_lib.find('controller.ai.walker')
+        self.ped_controller = self.world.spawn_actor(
+            ctrl_bp, carla.Transform(), attach_to=self.pedestrian,
+        )
+
+        # Initial direction
+        if direction is None:
+            direction = carla.Vector3D(x=1.0, y=0.0, z=0.0)
+
+        self._ped_speed = speed
+        self._ped_direction = direction
+
+        # Apply initial walk command
+        control = carla.WalkerControl(
+            direction=self._ped_direction,
+            speed=self._ped_speed,
+        )
+        self.pedestrian.apply_control(control)
+
+        print(f"[Env] Pedestrian spawned at "
+              f"({spawn_location.x:.1f}, {spawn_location.y:.1f})")
+
+    def update_pedestrian_patrol(
+        self,
+        centre: tuple,
+        inner_radius: float,
+        outer_radius: float,
+        section_angle: float,
+    ) -> None:
+        """
+        Make the pedestrian patrol radially between *inner_radius* and
+        *outer_radius* at a fixed angular position.
+
+        Call this every simulation tick.  When the pedestrian crosses a
+        boundary radius it reverses direction.
+        """
+        if self.pedestrian is None:
+            return
+
+        loc = self.pedestrian.get_location()
+        dx = loc.x - centre[0]
+        dy = loc.y - centre[1]
+        r = math.sqrt(dx * dx + dy * dy)
+
+        # Radial unit vector (outward)
+        if r < 1e-3:
+            return
+        ur_x = dx / r
+        ur_y = dy / r
+
+        # Reverse direction at boundaries
+        # _ped_outward: True = walking outward, False = walking inward
+        if not hasattr(self, '_ped_outward'):
+            self._ped_outward = False          # start walking inward
+
+        if r >= outer_radius:
+            self._ped_outward = False           # turn inward
+        elif r <= inner_radius:
+            self._ped_outward = True            # turn outward
+
+        sign = 1.0 if self._ped_outward else -1.0
+        direction = carla.Vector3D(
+            x=float(sign * ur_x),
+            y=float(sign * ur_y),
+            z=0.0,
+        )
+
+        control = carla.WalkerControl(
+            direction=direction,
+            speed=self._ped_speed,
+        )
+        self.pedestrian.apply_control(control)
+
     def __del__(self):
+        # Destroy pedestrian + controller first
+        if self.ped_controller is not None:
+            self.ped_controller.stop()
+            self.ped_controller.destroy()
+        if self.pedestrian is not None:
+            self.pedestrian.destroy()
         self.world.apply_settings(self.original_settings)
         print('done')
 
