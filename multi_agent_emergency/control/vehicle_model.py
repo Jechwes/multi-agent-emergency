@@ -36,9 +36,8 @@ class Vehicle:
         self.steer = self.vehicle.get_control().steer
         self.merge_length = max(4 * self.v, 12)
 
-        wb_vec = self.vehicle.get_physics_control().wheels[0].position - \
-                 self.vehicle.get_physics_control().wheels[2].position
-        self.yaw = math.atan2(wb_vec.y, wb_vec.x)
+        fwd = self.vehicle.get_transform().get_forward_vector()
+        self.yaw = math.atan2(fwd.y, fwd.x)
 
     def predict(self, a, delta):
         '''Bicycle Model for vehicles'''

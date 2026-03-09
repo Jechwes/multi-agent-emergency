@@ -5,7 +5,7 @@ from queue import Queue
 import weakref
 
 class Environment:
-    def __init__(self, args):
+    def __init__(self, args, ego_transform=None):
         self.client = carla.Client(args.host, args.port)
         self.client.set_timeout(3.0)
         self.world = self.client.load_world('Town03')
@@ -21,11 +21,13 @@ class Environment:
         self.sensor_queue = Queue()
 
         # -------------- Vehicle settings -------------- #
-        # Vehicle 1
-        _init_loc = carla.Location(x=-2.1, y=20.2, z=0.3)
-        _init_rot = carla.Rotation(pitch=0.0,yaw=0,roll=0.0)
-        car_init_tran = carla.Transform(_init_loc, _init_rot)
-        self.ego_car = self.add_car(car_init_tran, "50, 50, 200")
+        if ego_transform is None:
+            # Legacy default (section ≈ 3, lane 1 of Town03 roundabout)
+            _init_loc = carla.Location(x=-2.1, y=20.2, z=0.3)
+            _init_rot = carla.Rotation(pitch=0.0, yaw=0, roll=0.0)
+            ego_transform = carla.Transform(_init_loc, _init_rot)
+
+        self.ego_car = self.add_car(ego_transform, "50, 50, 200")
 
         # # Vehicle 2
         # _init_loc = carla.Location(x=-11.1, y=16.5, z=0.3)

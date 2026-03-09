@@ -153,7 +153,7 @@ class MPC_controller:
     def gen_ref_traj(self, target, des_speed):
         z_ref = np.zeros((self.x_dim, self.horizon))
 
-        for i in range(1, self.horizon):
+        for i in range(0, self.horizon):
 
             z_ref[0, i] = target[0]
             z_ref[1, i] = target[1]
@@ -161,6 +161,27 @@ class MPC_controller:
             z_ref[3, i] = target[2]
 
         return z_ref
+
+    def solve_trajectory(self, ref_traj_4xH):
+        """
+        Solve MPC with a pre-built (4, horizon) reference trajectory.
+
+        Parameters
+        ----------
+        ref_traj_4xH : np.ndarray (4, horizon)
+            Each column is [x, y, v, yaw] for one horizon step.
+
+        Returns
+        -------
+        carla.VehicleControl
+        """
+        self.car.update()
+        X_0 = np.array([self.car.x, self.car.y, self.car.v, self.car.yaw])
+        self.opti.set_value(self.X_0, X_0)
+        self.opti.set_value(self.X_ref, ref_traj_4xH)
+        sol = self.opti.solve()
+        opt_inputs = sol.value(self.U)
+        return self.gen_cmd(opt_inputs[0, 0], opt_inputs[1, 0])
 
 
 
