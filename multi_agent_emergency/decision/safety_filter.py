@@ -1,24 +1,27 @@
 """
 safety_filter.py
 ================
-Online safety filter that monitors the risk value function produced by
-the ``RoundaboutDPDecisionMaker`` and can override the nominal driving
-action when the situation becomes too risky.
+Online safety filter that monitors the ego car's environment and
+intervenes when necessary.
 
-Architecture
-------------
-Every simulation tick the filter is called with the current Frenet state
-(s, d) and the pedestrian lateral position (p_lateral).  It queries
-``maker.get_risk_at(s, d, p)`` and compares against three thresholds:
+The safety filter does NOT do any online optimisation.  It uses a simple
+crash-cost hierarchy to decide which lane to steer toward when no
+completely safe option exists:
 
-    risk ≤ WARN_THRESH          → NOMINAL   (no intervention)
-    WARN_THRESH < risk ≤ BRAKE  → CAUTION   (reduce speed)
-    risk > BRAKE_THRESH         → BRAKE     (full stop + lane shift)
+    Crash cost hierarchy (lower = preferred)
+    -----------------------------------------
+      non-drivable area   :  200
+      another car          :  600
+      pedestrian           : 1000
 
-When intervening the filter can:
-  • Reduce the MPC speed reference  (caution)
-  • Force a full brake              (emergency)
-  • Shift the lateral reference     (evasive lane change)
+If a collision is detected, the simulation should be terminated with
+an appropriate error message by the caller.
+
+Intervention levels
+-------------------
+    NOMINAL   – no intervention, follow DP policy
+    CAUTION   – reduce speed, stay in lane
+    BRAKE     – emergency stop + suggest lane change
 """
 
 from __future__ import annotations
@@ -29,40 +32,59 @@ from typing import Optional, Tuple
 import numpy as np
 
 
+# ── Crash cost constants (lower = less bad) ──────────────────────────
+CRASH_COST_NONDRIVABLE  = 200.0
+CRASH_COST_CAR          = 600.0
+CRASH_COST_PEDESTRIAN   = 1000.0
+
+
 # ── Risk level enum ──────────────────────────────────────────────────
 class RiskLevel(Enum):
-    NOMINAL  = auto()   # safe – no intervention
-    CAUTION  = auto()   # elevated risk – slow down
-    BRAKE    = auto()   # high risk – full stop
+    NOMINAL  = auto()   # safe, no intervention
+    CAUTION  = auto()   # elevated risk, slow down
+    BRAKE    = auto()   # high risk, emergency stop
+
+
+# ── Collision error ──────────────────────────────────────────────────
+class CrashError(Exception):
+    """Raised when a collision is detected.  Contains a message
+    describing what the ego car crashed into."""
+    pass
 
 
 # ── SafetyFilter ─────────────────────────────────────────────────────
 class SafetyFilter:
     """
-    Online safety filter that monitors the DP risk value function.
+    Online safety filter.
 
     Parameters
     ----------
-    maker        : RoundaboutDPDecisionMaker (must have compute_risk_field done)
-    warn_thresh  : combined risk above which → CAUTION (speed reduction)
-    brake_thresh : combined risk above which → BRAKE   (emergency stop)
-    caution_speed_factor : MPC speed is multiplied by this during CAUTION
+    graph            : LaneletGraph (lane connectivity)
+    lane_width       : lane width [m]
+    n_lanes          : total number of lanes
+    drivable_lanes   : set of normally-drivable lane indices
+    warn_distance    : distance to obstacle triggering CAUTION [m]
+    brake_distance   : distance to obstacle triggering BRAKE [m]
+    caution_speed_factor : MPC speed multiplied by this during CAUTION
     """
 
     def __init__(
         self,
-        maker,
-        warn_thresh:  float = 15.0,
-        brake_thresh: float = 40.0,
+        graph,
+        lane_width: float,
+        n_lanes: int,
+        drivable_lanes: set,
+        warn_distance: float = 12.0,
+        brake_distance: float = 6.0,
         caution_speed_factor: float = 0.4,
     ) -> None:
-        self.maker = maker
-        self.warn_thresh  = warn_thresh
-        self.brake_thresh = brake_thresh
+        self.graph = graph
+        self.lane_width = lane_width
+        self.n_lanes = n_lanes
+        self.drivable_lanes = set(drivable_lanes)
+        self.warn_distance = warn_distance
+        self.brake_distance = brake_distance
         self.caution_speed_factor = caution_speed_factor
-
-        # Track previous risk for logging trend
-        self._prev_risk: float = 0.0
 
     # ------------------------------------------------------------------
     # Core evaluation
@@ -70,97 +92,147 @@ class SafetyFilter:
 
     def evaluate(
         self,
-        s: float,
-        d: float,
-        p_lateral: Optional[float] = None,
-    ) -> Tuple[RiskLevel, float, dict]:
+        d_ego: float,
+        current_lane: int,
+        ped_distance: Optional[float] = None,
+        ped_on_lane: Optional[int] = None,
+    ) -> Tuple[RiskLevel, dict]:
         """
-        Evaluate risk at the current state.
+        Evaluate the current risk level.
 
         Parameters
         ----------
-        s          : longitudinal Frenet coordinate
-        d          : lateral Frenet coordinate
-        p_lateral  : pedestrian lateral position (in same lateral-axis
-                     frame as d), or None if no pedestrian
+        d_ego        : lateral deviation from lane centre [m]
+        current_lane : current lane index
+        ped_distance : distance to pedestrian along driving direction [m],
+                       None if no pedestrian nearby
+        ped_on_lane  : which lane the pedestrian is on (None if far away)
 
         Returns
         -------
-        level      : RiskLevel enum
-        risk_total : combined scalar risk
-        components : per-dimension breakdown dict
+        level : RiskLevel
+        info  : dict with diagnostic details
         """
-        components = self.maker.get_risk_components(s, d, p_lateral)
-        risk_total = components['total']
-        self._prev_risk = risk_total
+        info = {'d_ego': d_ego, 'lane': current_lane,
+                'ped_dist': ped_distance, 'ped_lane': ped_on_lane}
 
-        if risk_total > self.brake_thresh:
-            level = RiskLevel.BRAKE
-        elif risk_total > self.warn_thresh:
-            level = RiskLevel.CAUTION
-        else:
-            level = RiskLevel.NOMINAL
+        # Check if ego is near boundary of its lane
+        half_w = self.lane_width / 2.0
+        at_boundary = abs(d_ego) > 0.85 * half_w
 
-        return level, risk_total, components
+        # Pedestrian proximity
+        ped_ahead = (ped_distance is not None
+                     and ped_on_lane == current_lane)
+
+        if ped_ahead and ped_distance < self.brake_distance:
+            return RiskLevel.BRAKE, info
+        if ped_ahead and ped_distance < self.warn_distance:
+            return RiskLevel.CAUTION, info
+        if at_boundary and current_lane not in self.drivable_lanes:
+            return RiskLevel.CAUTION, info
+
+        return RiskLevel.NOMINAL, info
 
     # ------------------------------------------------------------------
-    # Action override
+    # Speed override
     # ------------------------------------------------------------------
 
-    def filter_speed(
-        self,
-        v_s_nominal: float,
-        level: RiskLevel,
-    ) -> float:
-        """
-        Adjust the longitudinal speed reference based on risk level.
-
-        NOMINAL  → pass through
-        CAUTION  → reduce speed by caution factor
-        BRAKE    → 0 m/s  (full stop)
-        """
+    def filter_speed(self, v_s_nominal: float, level: RiskLevel) -> float:
+        """Adjust speed based on risk level."""
         if level == RiskLevel.BRAKE:
             return 0.0
         elif level == RiskLevel.CAUTION:
             return v_s_nominal * self.caution_speed_factor
-        else:
-            return v_s_nominal
+        return v_s_nominal
 
-    def suggest_d_ref(
+    # ------------------------------------------------------------------
+    # Lane suggestion using crash-cost hierarchy
+    # ------------------------------------------------------------------
+
+    def suggest_lane(
         self,
-        d_ref_nominal: float,
+        current_lane: int,
         level: RiskLevel,
-        p_lateral: Optional[float] = None,
-    ) -> float:
+        ped_on_lane: Optional[int] = None,
+    ) -> int:
         """
-        Suggest a lateral reference that steers away from danger.
+        Suggest the safest lane to drive on.
 
-        NOMINAL  → keep nominal d_ref
-        CAUTION  → commit to safest lane (decisive lane change)
-        BRAKE    → commit to safest lane
+        NOMINAL  -> keep current lane (or nearest drivable if off-road)
+        CAUTION / BRAKE -> pick lane with lowest crash cost
+
+        Cost per lane:
+          - pedestrian on that lane     → CRASH_COST_PEDESTRIAN
+          - lane is non-drivable        → CRASH_COST_NONDRIVABLE
+          - else                        → 0
         """
         if level == RiskLevel.NOMINAL:
-            return d_ref_nominal
+            if current_lane in self.drivable_lanes:
+                return current_lane
+            # Snap to nearest drivable
+            return min(self.drivable_lanes,
+                       key=lambda l: abs(l - current_lane))
 
-        d_safe = self.maker.get_safest_lane_d(p_lateral)
-        return d_safe
+        # Evaluate all reachable lanes (current + adjacent)
+        candidates = [current_lane] + self.graph.adjacent_lanes(current_lane)
+        best_lane = current_lane
+        best_cost = float('inf')
+
+        for lane in candidates:
+            cost = 0.0
+            if lane == ped_on_lane:
+                cost += CRASH_COST_PEDESTRIAN
+            if lane not in self.drivable_lanes:
+                cost += CRASH_COST_NONDRIVABLE
+            if cost < best_cost:
+                best_cost = cost
+                best_lane = lane
+
+        return best_lane
+
+    # ------------------------------------------------------------------
+    # Collision detection
+    # ------------------------------------------------------------------
+
+    def check_collision(
+        self,
+        d_ego: float,
+        current_lane: int,
+        ped_distance: Optional[float] = None,
+        ped_on_lane: Optional[int] = None,
+        collision_radius: float = 1.5,
+    ) -> Optional[str]:
+        """
+        Check if a collision has occurred.
+
+        Returns
+        -------
+        None if no collision, otherwise a string describing the crash:
+            "Crashed into pedestrian"
+            "Crashed into non-drivable area"
+        """
+        # Pedestrian collision
+        if (ped_distance is not None
+            and ped_on_lane == current_lane
+            and ped_distance < collision_radius):
+            return "Crashed into pedestrian"
+
+        # Off-road: ego beyond lane boundary on non-drivable side
+        half_w = self.lane_width / 2.0
+        if abs(d_ego) > half_w and current_lane not in self.drivable_lanes:
+            return "Crashed into non-drivable area"
+
+        return None
 
     # ------------------------------------------------------------------
     # Pretty print
     # ------------------------------------------------------------------
 
-    def summary_line(
-        self,
-        level: RiskLevel,
-        risk_total: float,
-        components: dict,
-    ) -> str:
-        """One-line risk summary for logging."""
-        tag = level.name
+    def summary_line(self, level: RiskLevel, info: dict) -> str:
+        """One-line summary for logging."""
         return (
-            f"[SafetyFilter] {tag}  "
-            f"risk={risk_total:.1f}  "
-            f"(s={components['s']:.1f}  d={components['d']:.1f}  "
-            f"p={components['p']:.1f})  "
-            f"thresholds: warn={self.warn_thresh}, brake={self.brake_thresh}"
+            f"[SafetyFilter] {level.name}  "
+            f"lane={info['lane']}  d={info['d_ego']:.2f}  "
+            f"ped_dist={info.get('ped_dist', '-')}  "
+            f"ped_lane={info.get('ped_lane', '-')}"
         )

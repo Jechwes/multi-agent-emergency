@@ -9,7 +9,7 @@ class Environment:
     def __init__(self, args, ego_transform=None):
         self.client = carla.Client(args.host, args.port)
         self.client.set_timeout(3.0)
-        self.world = self.client.load_world('Town03')
+        self.world = self.client.load_world('Town03_Opt')
 
         self.original_settings = self.world.get_settings()
         self.dt = 0.01
@@ -125,6 +125,7 @@ class Environment:
         inner_radius: float,
         outer_radius: float,
         section_angle: float,
+        wait_at_outer: float = 0.0,
     ) -> None:
         """
         Make the pedestrian patrol radially between *inner_radius* and
@@ -132,6 +133,11 @@ class Environment:
 
         Call this every simulation tick.  When the pedestrian crosses a
         boundary radius it reverses direction.
+
+        Parameters
+        ----------
+        wait_at_outer : float
+            Seconds to wait at the outer edge before walking back inward.
         """
         if self.pedestrian is None:
             return
@@ -151,11 +157,25 @@ class Environment:
         # _ped_outward: True = walking outward, False = walking inward
         if not hasattr(self, '_ped_outward'):
             self._ped_outward = False          # start walking inward
+            self._ped_wait_ticks = 0           # tick counter for pause
+            self._ped_wait_duration = int(wait_at_outer / self.dt) if self.dt > 0 else 0
 
         if r >= outer_radius:
+            if self._ped_outward:               # just arrived at outer edge
+                self._ped_wait_ticks = self._ped_wait_duration
             self._ped_outward = False           # turn inward
         elif r <= inner_radius:
             self._ped_outward = True            # turn outward
+
+        # If waiting at a boundary, stay still and count down
+        if self._ped_wait_ticks > 0:
+            self._ped_wait_ticks -= 1
+            control = carla.WalkerControl(
+                direction=carla.Vector3D(0, 0, 0),
+                speed=0.0,
+            )
+            self.pedestrian.apply_control(control)
+            return
 
         sign = 1.0 if self._ped_outward else -1.0
         direction = carla.Vector3D(
