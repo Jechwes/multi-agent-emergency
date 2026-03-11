@@ -208,16 +208,23 @@ def build_label_matrices(
     N_d: int,
     centres_d: np.ndarray,
     lane_width: float,
-    n_letters: int = 3,
+    n_letters: int = 4,
     boundary_fraction: float = 0.85,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Build per-dimension label indicator matrices.
 
-    Alphabet:
-        0 -> 'safe'       within the lane
-        1 -> 'risk_low'   (unused in current labelling)
-        2 -> 'risk_high'  at the lane boundary
+    Co-safety alphabet (4 letters):
+        0 -> 'safe'          ¬nd ∧ ¬ped ∧ ¬car   (within the lane)
+        1 -> 'non_drivable'  at/beyond the lane boundary
+        2 -> 'pedestrian'    (not used in offline masks)
+        3 -> 'other_car'     (not used in offline masks)
+
+    Only letters 0 and 1 are assigned in the static offline masks.
+    Letters 2, 3 are zero rows — they exist so that the matrix
+    dimensions match the DFA alphabet size.  Because only letter 0
+    self-loops in the co-safety DFA, the DFATree only ever reads
+    the 'safe' row during value iteration.
 
     Returns: L_s (n_letters, N_s), L_d (n_letters, N_d)
     """
@@ -230,7 +237,7 @@ def build_label_matrices(
     L_d = np.zeros((n_letters, N_d), dtype=float)
     for i, d in enumerate(centres_d):
         if abs(d) >= thresh:
-            L_d[2, i] = 1.0   # risk_high at edges
+            L_d[1, i] = 1.0   # non_drivable at edges
         else:
             L_d[0, i] = 1.0   # safe
 
@@ -246,16 +253,20 @@ def _build_pedestrian_labels(
     lane_width: float,
     n_lanes: int,
     ref_lane: int,
-    n_letters: int = 3,
+    n_letters: int = 4,
 ) -> np.ndarray:
-    """Label matrix for pedestrian on the reference lane."""
+    """Label matrix for pedestrian dimension.
+
+    When the pedestrian is on the reference (driving) lane, the label
+    is 'pedestrian' (col 2).  Otherwise 'safe' (col 0).
+    """
     d_low = (ref_lane - n_lanes / 2.0) * lane_width
     d_high = d_low + lane_width
 
     L_p = np.zeros((n_letters, len(centres_p)), dtype=float)
     for i, dp in enumerate(centres_p):
         if d_low <= dp < d_high:
-            L_p[2, i] = 1.0   # risk_high
+            L_p[2, i] = 1.0   # pedestrian on driving lane
         else:
             L_p[0, i] = 1.0   # safe
     return L_p
@@ -336,7 +347,7 @@ def build_abstraction(
     boundary_penalty: float = 50.0,
     p_move: float = 0.3,
     ped_on_road_penalty: float = 50.0,
-    n_letters: int = 3,
+    n_letters: int = 4,
 ) -> Dict:
     """
     Build a single decoupled MDP abstraction + lanelet graph.

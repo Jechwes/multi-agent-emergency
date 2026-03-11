@@ -139,7 +139,7 @@ def main():
     LANE_WIDTH   = 4.0
     N_LANES      = 4
     N_SECTIONS   = 12
-    DRIVE_LANE   = 2          # initial lane (drivable inner = 1, outer = 2)
+    DRIVE_LANE   = 1          # initial lane (drivable inner = 1, outer = 2)
     DIRECTION    = "cw"
 
     # DP grid
@@ -171,10 +171,10 @@ def main():
     N_VI_PER_ITER = 10
 
     # Safety filter
-    SF_WARN_DIST     = 12.0       # pedestrian warning distance [m]
-    SF_BRAKE_DIST    = 6.0        # pedestrian brake distance [m]
+    SF_WARN_DIST     = 20.0       # pedestrian warning distance [m]
+    SF_BRAKE_DIST    = 8.0        # pedestrian brake distance [m]
     SF_CAUTION_FACTOR = 0.4
-    COLLISION_RADIUS = 1.5        # collision detection radius [m]
+    COLLISION_RADIUS = 1        # collision detection radius [m]
 
     try:
         # =================================================================
@@ -264,7 +264,7 @@ def main():
             boundary_penalty=EDGE_PENALTY,
             p_move=P_MOVE,
             ped_on_road_penalty=PED_PENALTY,
-            n_letters=3,
+            n_letters=4,
         )
 
         dfa = RoundaboutDFA()
@@ -285,6 +285,7 @@ def main():
         #  5. SAFETY FILTER
         # =================================================================
         safety_filter = SafetyFilter(
+            dfa=dfa,
             graph=graph,
             lane_width=LANE_WIDTH,
             n_lanes=N_LANES,
@@ -302,15 +303,23 @@ def main():
         PED_ANGLE_AHEAD  = math.radians(45)
         PED_ANGLE_BEHIND = math.radians(8)
 
+        _prev_ped_r = None
+
         def _get_ped_info(ego_xy: np.ndarray):
             """
-            Returns (ped_distance, ped_lane) or (None, None).
+            Returns (ped_distance, ped_lane, ped_target_lane).
 
-            ped_distance : s-direction distance [m]
-            ped_lane     : lane index the pedestrian is on
+            ped_distance    : s-direction distance [m]
+            ped_lane        : lane index the pedestrian is currently on
+            ped_target_lane : lane the pedestrian is moving toward
+                              (same as ped_lane if stationary / moving
+                              along the lane; None if ped is moving away
+                              from the road)
             """
+            nonlocal _prev_ped_r
             if env.pedestrian is None:
-                return None, None
+                _prev_ped_r = None
+                return None, None, None
             loc = env.pedestrian.get_location()
             dx_p = loc.x - CENTRE[0]
             dy_p = loc.y - CENTRE[1]
@@ -327,7 +336,8 @@ def main():
             )
 
             if signed_ang < -PED_ANGLE_AHEAD or signed_ang > PED_ANGLE_BEHIND:
-                return None, None
+                _prev_ped_r = r_ped
+                return None, None, None
 
             # Compute approximate s-distance
             r_ego = math.sqrt(dx_e * dx_e + dy_e * dy_e)
@@ -337,7 +347,23 @@ def main():
             ped_lane = int((r_ped - INNER_RADIUS) / LANE_WIDTH)
             ped_lane = max(0, min(N_LANES - 1, ped_lane))
 
-            return arc_dist, ped_lane
+            # Determine target lane from radial velocity
+            if _prev_ped_r is not None:
+                dr = r_ped - _prev_ped_r
+                if dr < -0.05:
+                    # Moving inward → target is one lane inward
+                    ped_target_lane = max(0, ped_lane - 1)
+                elif dr > 0.05:
+                    # Moving outward → target is one lane outward
+                    ped_target_lane = min(N_LANES - 1, ped_lane + 1)
+                else:
+                    # Roughly stationary radially
+                    ped_target_lane = ped_lane
+            else:
+                ped_target_lane = ped_lane
+
+            _prev_ped_r = r_ped
+            return arc_dist, ped_lane, ped_target_lane
 
         # =================================================================
         #  6. MAIN SIMULATION LOOP
@@ -378,11 +404,12 @@ def main():
             current_lane = lane_id
 
             # --- Pedestrian info ---
-            ped_dist, ped_lane = _get_ped_info(ego_xy)
+            ped_dist, ped_lane, ped_target_lane = _get_ped_info(ego_xy)
 
             # --- Collision detection ---
             crash_msg = safety_filter.check_collision(
-                d_ego, current_lane, ped_dist, ped_lane,
+                d_ego, current_lane,
+                ped_distance=ped_dist, ped_on_lane=ped_lane,
                 collision_radius=COLLISION_RADIUS,
             )
             if crash_msg is not None:
@@ -390,8 +417,22 @@ def main():
 
             # --- Safety filter evaluation ---
             risk_level, sf_info = safety_filter.evaluate(
-                d_ego, current_lane, ped_dist, ped_lane,
+                d_ego, current_lane,
+                ped_distance=ped_dist, ped_on_lane=ped_lane,
+                collision_radius=COLLISION_RADIUS,
             )
+
+            # --- Advance DFA state based on actual AP violation ---
+            # dfa_label reflects real violations (collision / off-road),
+            # NOT proximity warnings.  The safety filter prevents
+            # violations; the DFA only transitions on actual failure.
+            dfa_label = sf_info['dfa_label']
+            maker.update_dfa_state(dfa_label)
+
+            # If the DFA entered its fail state, the spec is violated
+            if maker.q_current == dfa.sink:
+                raise CrashError(
+                    f"DFA entered fail state (label='{dfa_label}')")
 
             # --- DP policy lookup ---
             v_s, v_d = maker.get_action(s_ego, d_ego)
@@ -399,13 +440,28 @@ def main():
             # --- Safety filter overrides ---
             v_s_safe = safety_filter.filter_speed(v_s, risk_level)
             target_lane = safety_filter.suggest_lane(
-                current_lane, risk_level, ped_lane,
+                current_lane, risk_level,
+                ped_on_lane=ped_lane, ped_distance=ped_dist,
+                ped_target_lane=ped_target_lane,
             )
+
+            # If staying in current lane during CAUTION/BRAKE, force
+            # v_d = 0 so the MPC keeps the car straight (no diagonal).
+            if target_lane == current_lane and risk_level != RiskLevel.NOMINAL:
+                dp_v_d_override = 0.0
+            else:
+                dp_v_d_override = None   # use DP's v_d
+
+            # If lane change was decided, give the car enough speed to
+            # actually complete the manoeuvre (don't crawl sideways)
+            if target_lane != current_lane:
+                v_s_safe = max(v_s_safe, v_s * 0.6)
 
             # dp_action for MPC reference (uses filtered speed)
             def dp_action_filtered(s: float, d: float):
                 _, v_d_nom = maker.get_action(s, d)
-                return v_s_safe, v_d_nom
+                v_d_use = dp_v_d_override if dp_v_d_override is not None else v_d_nom
+                return v_s_safe, v_d_use
 
             # --- Build MPC reference trajectory ---
             ref_traj = build_mpc_reference(
@@ -450,7 +506,7 @@ def main():
                     f"s={s_ego:.2f}, d={d_ego:.2f}, "
                     f"v_s={v_s:.1f}→{v_s_safe:.1f}, v_d={v_d:.2f}, "
                     f"ego_v={ego_v:.1f} m/s  "
-                    f"| SF:{risk_level.name}"
+                    f"| SF:{risk_level.name} threat={sf_info['threat']} dfa={dfa_label}"
                 )
             elif risk_level != RiskLevel.NOMINAL and step % 10 == 0:
                 print(safety_filter.summary_line(risk_level, sf_info))
