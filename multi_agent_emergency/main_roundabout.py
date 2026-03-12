@@ -1,294 +1,528 @@
+"""
+main_roundabout.py
+==================
+Single-car roundabout scenario using:
+
+  1. **Single DFATree-based DP**  (offline, computed once)
+     Risk-minimising decoupled value iteration.  Cost design:
+       - road cells have *negative* cost → reward for driving
+       - lane edges have *positive* cost → risk penalty
+       - higher forward speed gets a lower (more negative) action cost
+     ⟹ The car naturally drives forward and stays centred.
+
+  2. **Safety filter**  (online, crash-cost hierarchy)
+     Monitors the ego car and overrides speed / lane when danger
+     is detected.  If a collision occurs, the simulation terminates.
+
+  3. **MPC tracking controller**  (Cartesian reference from DP policy)
+
+Architecture
+------------
+    ┌───────────────┐     ┌────────────────────┐     ┌──────────────┐
+    │ Roundabout     │────▶│ DFATree DP         │────▶│ MPC Tracker  │
+    │ Lanelet Map    │     │ (offline, 1 tree)  │     │ (CARLA)      │
+    └───────────────┘     └────────────────────┘     └──────────────┘
+          ▲                        │                      ▲
+          │  Frenet (s,d)         │ (v_s,v_d) policy     │
+          └────────────────────────┘                      │
+                                                          │
+                              ┌──────────────┐            │
+                              │ Safety Filter │────────────┘
+                              │ (crash costs) │  override speed/lane
+                              └──────────────┘
+"""
+
 import argparse
 import time
-try:
-    import numpy as np # Fixed typo 'as py'
-    import sys
-    import os
-
-    from os import path as osp
-except ImportError:
-    raise RuntimeError('import error!')
-
-# Add the directory containing your local modules
-script_dir = os.path.dirname(os.path.abspath(__file__))
-local_module_dir = os.path.join(script_dir, 'decision/')
-for root, dirs, files in os.walk(local_module_dir):
-    if root not in sys.path:
-        sys.path.append(root)
-
-from queue import Empty
-from decision.specification.ltl_spec import Translate
-from scenarios.roundabout import *
-import control.vehicle_model as model
-from control.trackingMPC import MPC_controller 
-from perception.grid_polar import Griding
-from decision.abstraction.abstract_polar import Abstraction
-from decision.maker_roundabout import Risk_LTL
 import math
+from typing import Optional
 
-def reachability_check(cur_pos, target_pos, threshold):
+import numpy as np
+import sys
+import os
+
+# ---------------------------------------------------------------------------
+# Path setup
+# ---------------------------------------------------------------------------
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
+
+_LOGIC_DIR = os.path.abspath(os.path.join(script_dir, '..', '..', 'logic_auto_driving_COPY'))
+if _LOGIC_DIR not in sys.path:
+    sys.path.append(_LOGIC_DIR)
+
+# ---------------------------------------------------------------------------
+# Project imports
+# ---------------------------------------------------------------------------
+from scenarios.roundabout import *            # Environment, carla
+import control.vehicle_model as model
+from control.trackingMPC import MPC_controller
+
+from abstraction.roundabout_lanelets import RoundaboutLaneletMap
+from abstraction.roundabout_abstraction import build_abstraction, LaneletGraph
+
+from decision.specification.roundabout_dfa import RoundaboutDFA
+from decision.maker_roundabout_dp import RoundaboutDPDecisionMaker
+from decision.safety_filter import SafetyFilter, RiskLevel, CrashError
+
+
+# ---------------------------------------------------------------------------
+# MPC reference-trajectory builder
+# ---------------------------------------------------------------------------
+
+def build_mpc_reference(
+    action_fn,
+    rmap: RoundaboutLaneletMap,
+    s0: float,
+    d0: float,
+    section: int,
+    lane: int,
+    mpc_dt: float,
+    mpc_horizon: int,
+    d_ref: float = 0.0,
+) -> np.ndarray:
     """
-    Checks if the current position is within a certain distance (threshold) of the target position.
+    Roll out the DP policy at MPC resolution and convert each
+    Frenet waypoint to Cartesian.
+
+    Returns
+    -------
+    ref : np.ndarray (4, mpc_horizon)   [x, y, v, yaw]
     """
-    if np.linalg.norm(np.array(cur_pos) - np.array(target_pos)) < threshold:
-        return True
-    else:
-        return False
+    ref = np.zeros((4, mpc_horizon), dtype=float)
+    s = s0
+    sec = section
+    sl = rmap.get_section_lanelet(sec, lane)
+
+    for k in range(mpc_horizon):
+        v_s, v_d = action_fn(s, d0)
+        s += v_s * mpc_dt
+
+        while s >= sl.arc_length:
+            s -= sl.arc_length
+            sec = rmap.next_section(sec)
+            sl = rmap.get_section_lanelet(sec, lane)
+        while s < 0:
+            sec = rmap.prev_section(sec)
+            sl = rmap.get_section_lanelet(sec, lane)
+            s += sl.arc_length
+
+        cart = sl.to_cartesian(s, d_ref)
+        ref[0, k] = cart.x
+        ref[1, k] = cart.y
+        ref[2, k] = max(abs(v_s), 1.0)
+        ref[3, k] = cart.heading
+
+    return ref
+
+
+# ===========================================================================
+# Main
+# ===========================================================================
 
 def main():
-    argparser = argparse.ArgumentParser(description='Carla ArgParser practice')
-    argparser.add_argument('--host', metavar='H', default='127.0.0.1', help='IP of the host server')
-    argparser.add_argument('-p', '--port', default=2000, type=int, help='TCP port to listen to')
-    argparser.add_argument('-a', '--autopilot', action='store_true', help='enable autopilot')
+    argparser = argparse.ArgumentParser(description='Roundabout DP + MPC')
+    argparser.add_argument('--host', default='127.0.0.1', help='Host IP')
+    argparser.add_argument('-p', '--port', default=2000, type=int)
     args = argparser.parse_args()
     running = True
     env = None
 
-    # ---------- Specification Define --------------------
-    # Define Linear Temporal Logic (LTL) specifications for safety and task completion.
-    safe_spec = Translate("G(~n)", AP_set=['n'])
+    # =====================================================================
+    #  CONFIGURATION
+    # =====================================================================
+    # Geometry
+    CENTRE       = (-0.5, 0.5)
+    INNER_RADIUS = 13.5
+    LANE_WIDTH   = 4.0
+    N_LANES      = 4
+    N_SECTIONS   = 12
+    DRIVE_LANE   = 1          # initial lane (drivable inner = 1, outer = 2)
+    DIRECTION    = "cw"
 
-    # scltl_spec: "Finally (F) reach Target (t)"
-    scltl_spec = Translate("F(t)", AP_set=['t'])
+    # DP grid
+    N_S          = 10
+    N_D          = 8
+    V_S_MAX      = 10.0
+    V_D_MAX      = 2.0
+    N_SPEED_S    = 5
+    N_SPEED_D    = 5
+
+    # Pedestrian
+    N_P          = 8
+    P_MOVE       = 0.3
+    PED_PENALTY  = 50.0
+    PED_WAIT_AT_EDGE = 1.0
+
+    # DP parameters
+    DT_DP        = 0.05
+    GAMMA        = 0.5
+    K_SPEED      = 0.5
+    K_LAT        = 0.1
+    ROAD_REWARD  = -1.0
+    EDGE_PENALTY = 50.0
+    DRIVABLE_LANES = (1, 2)
+
+    # DFA tree solver
+    N_TREE_ITERS  = 3
+    N_GROW        = 2
+    N_VI_PER_ITER = 10
+
+    # Safety filter
+    SF_WARN_DIST     = 20.0       # pedestrian warning distance [m]
+    SF_BRAKE_DIST    = 8.0        # pedestrian brake distance [m]
+    SF_CAUTION_FACTOR = 0.4
+    COLLISION_RADIUS = 1        # collision detection radius [m]
 
     try:
-        env = Environment(args)
+        # =================================================================
+        #  1. ROUNDABOUT LANELET MAP
+        # =================================================================
+        rmap = RoundaboutLaneletMap(
+            centre=CENTRE,
+            inner_radius=INNER_RADIUS,
+            lane_width=LANE_WIDTH,
+            n_lanes=N_LANES,
+            n_sections=N_SECTIONS,
+            direction=DIRECTION,
+        )
+        print(rmap.summary())
+
+        section_L = rmap.section_arc_length(DRIVE_LANE)
+        print(f"Drive lane section arc length (lane {DRIVE_LANE}): {section_L:.2f} m")
+
+        # Compute spawn pose
+        _orig_spawn = np.array([-2.1, 20.2])
+        start_section = rmap._identify_section(_orig_spawn)
+        sl_start = rmap.get_section_lanelet(start_section, DRIVE_LANE)
+        cart_start = sl_start.to_cartesian(0.5 * sl_start.arc_length, 0.0)
+        ego_sp = carla.Transform(
+            carla.Location(x=cart_start.x, y=cart_start.y, z=0.3),
+            carla.Rotation(yaw=math.degrees(cart_start.heading)),
+        )
+        print(f"Spawn: section={start_section}, "
+              f"x={cart_start.x:.2f}, y={cart_start.y:.2f}, "
+              f"heading={math.degrees(cart_start.heading):.1f}°")
+
+        # =================================================================
+        #  2. CARLA ENVIRONMENT
+        # =================================================================
+        env = Environment(args, ego_transform=ego_sp)
         env.world.tick()
 
-        # Initialize spectator 
         spectator = env.world.get_spectator()
-        transform = spectator.get_transform()
-        spectator.set_transform(carla.Transform(carla.Location(z=50), carla.Rotation(pitch=-90)))
-
-        # Define the origin point for the abstract grid system
-        origin = carla.Location(x=-0.5, y=0.5, z=0.2)
-
-        # Initialize vehicle physics model and MPC controller
-        ego_car_model = model.Vehicle(env.ego_car, env.dt, origin)
-        ego_controller = MPC_controller(ego_car_model) 
-
-        # -------------- Grid -----------------
-        # Settings
-        lane_start = 13.5 #[17.5 is start of inner lane]
-        lane_amount = 4
-        angle_step = 12
-        cell_width = 4
-
-        # specific_angle_step e.g. 10 degrees
-        grid = Griding(env.world, origin, lane_start, lane_amount, cell_width, angle_step)
-        grid_time = 30
-        grid.draw_grid_map_polar(grid_time)
-
-        # --------------- Control --------------
-        # Initialize controller
-        car_model = model.Vehicle(env.ego_car, env.dt, origin)
-        ego_controller = MPC_controller(car_model) 
-
-        # ------------------- Labelling ------------------------
-        # TODO: DYNAMIC LABELLING LATER TOEVOEGEN!
-
-        # STATIC LABELS: Define fixed regions in the polar grid
-        # Key: (ring_idx, sector_idx), Value: label
-        static_label = {}
-        n_sectors = int(360 / angle_step)
-        
-        for s in range(n_sectors):
-            # Ring 0: Inner non-drivable
-            static_label[(0, s)] = 'n'
-            
-            # Rings 1 & 2: Roundabout
-            static_label[(1, s)] = 'r'
-            static_label[(2, s)] = 'r'
-            
-            # Ring 3: Outer non-drivable (except sector 16)
-            if s != 16:
-                static_label[(3, s)] = 'n'
-            else:
-                static_label[(3, s)] = 't'
-
-        # ---------- Initialization for Ego's Decision Maker --------------------
-        ego_local_state = (0, 0, 0) 
-        ego_prod_state = (0, 1, 1)  
-        _ego_abs_state = [-1, -1]
-
-        # Initialize the Abstraction Model (Polar Version)
-        # origin, lane_start, lane_amount, cell_width, angle_step, initial_position, label_function, scenario
-        abs_model = Abstraction(origin, lane_start, lane_amount, cell_width, angle_step, ego_local_state, static_label
+        spectator.set_transform(
+            carla.Transform(carla.Location(z=50), carla.Rotation(pitch=-90))
         )
-        
-        # Define costs for different labels (Adjust keys to match your labels: n, r, t)
 
-        # 'o': obstacle, 'n': non-drivable, 'r': road
-        cost_map = {"n": 50, "r": 0, "t": 0}
-        des_maker = Risk_LTL(abs_model, abs_model.MDP, safe_spec.dfa, scltl_spec.dfa, cost_map)
-        
-        stage = 0
-        iter = 0
-        planned_path = None
-        target_abs_state_sys = None
-        decision_index = None
-        optimal_policy = None
-        
-        # Initial control target (start point)
-        opt_action = (0, 0)
-        des_speed = 0
-        
-        while running:
-            iter += 1
-            env.world.tick()
+        # Spawn pedestrian on the outer edge, opposite to ego
+        PED_SECTION = (start_section + 6) % N_SECTIONS
+        r_ped_spawn = INNER_RADIUS + N_LANES * LANE_WIDTH
+        ped_angle = -(PED_SECTION + 0.5) * (2 * math.pi / N_SECTIONS)
+        ped_x = CENTRE[0] + r_ped_spawn * math.cos(ped_angle)
+        ped_y = CENTRE[1] + r_ped_spawn * math.sin(ped_angle)
+        env.spawn_pedestrian(
+            spawn_location=carla.Location(x=ped_x, y=ped_y, z=0.5),
+            speed=1.2,
+        )
+        PED_R_INNER = INNER_RADIUS + 1.75 * LANE_WIDTH
+        PED_R_OUTER = INNER_RADIUS + N_LANES * LANE_WIDTH
 
-            # Update ego vehicle model
-            ego_car_model.update()
-            
-            # Get current states
-            ego_local_state = ego_car_model.get_local_state()
-            ego_abs_state_index, ego_abs_state = abs_model.get_abs_ind_state(ego_local_state)
-            
-            # --- Check for State Change ---
-            # Only update decision if we moved to a new cell or don't have a plan yet
-            change_flag = False
-            if (target_abs_state_sys is None) or \
-               (ego_abs_state[0] != _ego_abs_state[0]) or \
-               (ego_abs_state[1] != _ego_abs_state[1]):
-                change_flag = True
-                
-            # --- Decision Making Step ---
-            if change_flag:
-                _ego_abs_state = ego_abs_state
-                
-                # TODO: Add dynamic labeling 
-                abs_model.update(ego_local_state, static_label)
+        # =================================================================
+        #  3. VEHICLE MODEL + MPC
+        # =================================================================
+        origin = carla.Location(x=CENTRE[0], y=CENTRE[1], z=0.2)
+        car_model = model.Vehicle(env.ego_car, env.dt, origin)
+        ego_controller = MPC_controller(car_model)
 
-                if ego_abs_state_index is None:
-                    # Vehicle out of bounds or invalid position
-                    pass
-                else: 
-                    ego_prod_state, decision_index, optimal_policy, decision_risk = des_maker.update(
-                        ego_prod_state,
-                        ego_abs_state_index,
-                        risk_th=0.1
-                    )
-                
-                # Get abstract action
-                if decision_index is not None:
-                    opt_action = abs_model.action_set[decision_index]
-                    
-                    target_r = ego_abs_state[0] + opt_action[0]
-                    target_theta = (ego_abs_state[1] + opt_action[1]) % n_sectors
-                    target_abs_state_sys = [target_r, target_theta]
-                    
-                    des_speed = np.hypot(opt_action[0], opt_action[1]) * 10.0 # Speed scale factor
-                        
-                    planned_path = des_maker.get_opt_path(ego_prod_state, optimal_policy, ego_abs_state)
-                
-            ego_state = (ego_car_model.x, ego_car_model.y)    
-            # --- Control Step ---
-            if target_abs_state_sys is not None:
-                if stage == 0:
+        MPC_DT      = ego_controller.dt
+        MPC_HORIZON = ego_controller.horizon
 
-                    t_r = lane_start + target_abs_state_sys[0] * cell_width + (cell_width/2)
-                    t_theta_deg = target_abs_state_sys[1] * angle_step + (angle_step/2)
-                    t_theta_rad = math.radians(t_theta_deg)
-                
-                    t_x = origin.x + t_r * math.cos(t_theta_rad)
-                    t_y = origin.y + t_r * math.sin(t_theta_rad)
-                
-                    carla_map = env.world.get_map()
-                    approx_loc = carla.Location(x=t_x, y=t_y, z=origin.z)
-                
-                    waypoint = carla_map.get_waypoint(approx_loc, project_to_road=True, lane_type=carla.LaneType.Driving)
-                
-                    if waypoint:
-                        target_point = (waypoint.transform.location.x, 
-                                        waypoint.transform.location.y, 
-                                        waypoint.transform.rotation.yaw)
-                    else:
-                        t_yaw = t_theta_deg + 90 
-                        target_point = (t_x, t_y, t_yaw)
-                    
-                    if reachability_check(ego_state, (-25.9, -7.6), 2):
-                        stage = 1
+        rmap.draw_in_carla(env.world, z=0.2, life_time=120.0,
+                           draw_s_grid=False, draw_section_labels=True)
+
+        # =================================================================
+        #  4. OFFLINE: BUILD ABSTRACTION + SOLVE DFATree (ONCE)
+        # =================================================================
+        abs_data = build_abstraction(
+            rmap=rmap,
+            ref_lane=DRIVE_LANE,
+            drivable_lanes=DRIVABLE_LANES,
+            dt=DT_DP,
+            N_s=N_S,
+            N_d=N_D,
+            N_p=N_P,
+            v_s_max=V_S_MAX,
+            v_d_max=V_D_MAX,
+            n_speed_levels_s=N_SPEED_S,
+            n_speed_levels_d=N_SPEED_D,
+            k_speed=K_SPEED,
+            k_lat=K_LAT,
+            road_reward=ROAD_REWARD,
+            boundary_penalty=EDGE_PENALTY,
+            p_move=P_MOVE,
+            ped_on_road_penalty=PED_PENALTY,
+            n_letters=4,
+        )
+
+        dfa = RoundaboutDFA()
+        print(dfa.summary())
+
+        maker = RoundaboutDPDecisionMaker(
+            dfa=dfa,
+            abs_data=abs_data,
+            gamma=GAMMA,
+            n_tree_iters=N_TREE_ITERS,
+            n_vi_per_iter=N_VI_PER_ITER,
+            n_grow=N_GROW,
+        )
+
+        graph = abs_data['graph']
+
+        # =================================================================
+        #  5. SAFETY FILTER
+        # =================================================================
+        safety_filter = SafetyFilter(
+            dfa=dfa,
+            graph=graph,
+            lane_width=LANE_WIDTH,
+            n_lanes=N_LANES,
+            drivable_lanes=DRIVABLE_LANES,
+            warn_distance=SF_WARN_DIST,
+            brake_distance=SF_BRAKE_DIST,
+            caution_speed_factor=SF_CAUTION_FACTOR,
+        )
+        print(f"\n[SafetyFilter] Initialised "
+              f"(warn={SF_WARN_DIST}m, brake={SF_BRAKE_DIST}m)")
+
+        # ---------------------------------------------------------------
+        # Pedestrian distance helper
+        # ---------------------------------------------------------------
+        PED_ANGLE_AHEAD  = math.radians(45)
+        PED_ANGLE_BEHIND = math.radians(8)
+
+        _prev_ped_r = None
+
+        def _get_ped_info(ego_xy: np.ndarray):
+            """
+            Returns (ped_distance, ped_lane, ped_target_lane).
+
+            ped_distance    : s-direction distance [m]
+            ped_lane        : lane index the pedestrian is currently on
+            ped_target_lane : lane the pedestrian is moving toward
+                              (same as ped_lane if stationary / moving
+                              along the lane; None if ped is moving away
+                              from the road)
+            """
+            nonlocal _prev_ped_r
+            if env.pedestrian is None:
+                _prev_ped_r = None
+                return None, None, None
+            loc = env.pedestrian.get_location()
+            dx_p = loc.x - CENTRE[0]
+            dy_p = loc.y - CENTRE[1]
+            r_ped = math.sqrt(dx_p * dx_p + dy_p * dy_p)
+
+            # Angular check: only consider ped ahead
+            dx_e = ego_xy[0] - CENTRE[0]
+            dy_e = ego_xy[1] - CENTRE[1]
+            ang_ped = math.atan2(dy_p, dx_p)
+            ang_ego = math.atan2(dy_e, dx_e)
+            signed_ang = math.atan2(
+                math.sin(ang_ped - ang_ego),
+                math.cos(ang_ped - ang_ego),
+            )
+
+            if signed_ang < -PED_ANGLE_AHEAD or signed_ang > PED_ANGLE_BEHIND:
+                _prev_ped_r = r_ped
+                return None, None, None
+
+            # Compute approximate s-distance
+            r_ego = math.sqrt(dx_e * dx_e + dy_e * dy_e)
+            arc_dist = r_ego * abs(signed_ang)
+
+            # Determine which lane the ped is on
+            ped_lane = int((r_ped - INNER_RADIUS) / LANE_WIDTH)
+            ped_lane = max(0, min(N_LANES - 1, ped_lane))
+
+            # Determine target lane from radial velocity
+            if _prev_ped_r is not None:
+                dr = r_ped - _prev_ped_r
+                if dr < -0.05:
+                    # Moving inward → target is one lane inward
+                    ped_target_lane = max(0, ped_lane - 1)
+                elif dr > 0.05:
+                    # Moving outward → target is one lane outward
+                    ped_target_lane = min(N_LANES - 1, ped_lane + 1)
                 else:
-                    target_point = (-65.1, -3.1, 0.3)
-                    if reachability_check(ego_state, (-65.1, -3.1), 2):
-                        print('Done!')
-                        return
+                    # Roughly stationary radially
+                    ped_target_lane = ped_lane
+            else:
+                ped_target_lane = ped_lane
 
-                
-                # Visualize
-                if planned_path:
-                    grid.draw_path(planned_path)
-                
-                # MPC Control
+            _prev_ped_r = r_ped
+            return arc_dist, ped_lane, ped_target_lane
+
+        # =================================================================
+        #  6. MAIN SIMULATION LOOP
+        # =================================================================
+        print("\n========== Starting simulation loop ==========\n")
+        step = 0
+        current_lane = DRIVE_LANE
+
+        while running:
+            step += 1
+            env.world.tick()
+            car_model.update()
+
+            # Update pedestrian patrol
+            env.update_pedestrian_patrol(
+                centre=CENTRE,
+                inner_radius=PED_R_INNER,
+                outer_radius=PED_R_OUTER,
+                section_angle=2 * math.pi / N_SECTIONS,
+                wait_at_outer=PED_WAIT_AT_EDGE,
+            )
+
+            # --- Ego state in Frenet ---
+            ego_xy = np.array([car_model.x, car_model.y])
+            ego_v  = car_model.v
+            ego_yaw = car_model.yaw
+
+            sec_id, lane_id, frenet = rmap.to_frenet(
+                ego_xy, speed=ego_v, yaw=ego_yaw,
+            )
+            s_ego = frenet.s
+            d_ego = frenet.d
+
+            # Snap to nearest drivable lane if off-road
+            if lane_id not in DRIVABLE_LANES:
+                lane_id = min(DRIVABLE_LANES,
+                              key=lambda l: abs(l - lane_id))
+            current_lane = lane_id
+
+            # --- Pedestrian info ---
+            ped_dist, ped_lane, ped_target_lane = _get_ped_info(ego_xy)
+
+            # --- Collision detection ---
+            crash_msg = safety_filter.check_collision(
+                d_ego, current_lane,
+                ped_distance=ped_dist, ped_on_lane=ped_lane,
+                collision_radius=COLLISION_RADIUS,
+            )
+            if crash_msg is not None:
+                raise CrashError(crash_msg)
+
+            # --- Safety filter evaluation ---
+            risk_level, sf_info = safety_filter.evaluate(
+                d_ego, current_lane,
+                ped_distance=ped_dist, ped_on_lane=ped_lane,
+                collision_radius=COLLISION_RADIUS,
+            )
+
+            # --- Advance DFA state based on actual AP violation ---
+            # dfa_label reflects real violations (collision / off-road),
+            # NOT proximity warnings.  The safety filter prevents
+            # violations; the DFA only transitions on actual failure.
+            dfa_label = sf_info['dfa_label']
+            maker.update_dfa_state(dfa_label)
+
+            # If the DFA entered its fail state, the spec is violated
+            if maker.q_current == dfa.sink:
+                raise CrashError(
+                    f"DFA entered fail state (label='{dfa_label}')")
+
+            # --- DP policy lookup ---
+            v_s, v_d = maker.get_action(s_ego, d_ego)
+
+            # --- Safety filter overrides ---
+            v_s_safe = safety_filter.filter_speed(v_s, risk_level)
+            target_lane = safety_filter.suggest_lane(
+                current_lane, risk_level,
+                ped_on_lane=ped_lane, ped_distance=ped_dist,
+                ped_target_lane=ped_target_lane,
+            )
+
+            # If staying in current lane during CAUTION/BRAKE, force
+            # v_d = 0 so the MPC keeps the car straight (no diagonal).
+            if target_lane == current_lane and risk_level != RiskLevel.NOMINAL:
+                dp_v_d_override = 0.0
+            else:
+                dp_v_d_override = None   # use DP's v_d
+
+            # If lane change was decided, give the car enough speed to
+            # actually complete the manoeuvre (don't crawl sideways)
+            if target_lane != current_lane:
+                v_s_safe = max(v_s_safe, v_s * 0.6)
+
+            # dp_action for MPC reference (uses filtered speed)
+            def dp_action_filtered(s: float, d: float):
+                _, v_d_nom = maker.get_action(s, d)
+                v_d_use = dp_v_d_override if dp_v_d_override is not None else v_d_nom
+                return v_s_safe, v_d_use
+
+            # --- Build MPC reference trajectory ---
+            ref_traj = build_mpc_reference(
+                action_fn=dp_action_filtered,
+                rmap=rmap,
+                s0=s_ego, d0=d_ego,
+                section=sec_id, lane=target_lane,
+                mpc_dt=MPC_DT,
+                mpc_horizon=MPC_HORIZON,
+                d_ref=0.0,
+            )
+
+            # --- MPC tracking ---
+            try:
+                control_cmd = ego_controller.solve_trajectory(ref_traj)
+                if risk_level == RiskLevel.BRAKE:
+                    control_cmd.throttle = 0.0
+                    control_cmd.brake = 1.0
+                env.ego_car.apply_control(control_cmd)
+            except Exception as e:
                 try:
-                    control_cmd = ego_controller.solve(target_point, des_speed)
+                    target_pt = (ref_traj[0, 0], ref_traj[1, 0], ref_traj[3, 0])
+                    speed = max(v_s_safe, 0.5)
+                    control_cmd = ego_controller.solve(target_pt, speed)
+                    if risk_level == RiskLevel.BRAKE:
+                        control_cmd.throttle = 0.0
+                        control_cmd.brake = 1.0
                     env.ego_car.apply_control(control_cmd)
-                except Exception as e:
-                    print(f"MPC Error: {e}")
-                    env.ego_car.apply_control(carla.VehicleControl(brake=1.0))
-            
+                except Exception:
+                    if risk_level == RiskLevel.BRAKE:
+                        env.ego_car.apply_control(
+                            carla.VehicleControl(brake=1.0, throttle=0.0))
+                    else:
+                        env.ego_car.apply_control(
+                            carla.VehicleControl(brake=0.0, throttle=0.3))
+
+            # --- Logging ---
+            if step % 100 == 0:
+                print(
+                    f"[Step {step}] "
+                    f"sec={sec_id}, lane={current_lane}→{target_lane}, "
+                    f"s={s_ego:.2f}, d={d_ego:.2f}, "
+                    f"v_s={v_s:.1f}→{v_s_safe:.1f}, v_d={v_d:.2f}, "
+                    f"ego_v={ego_v:.1f} m/s  "
+                    f"| SF:{risk_level.name} threat={sf_info['threat']} dfa={dfa_label}"
+                )
+            elif risk_level != RiskLevel.NOMINAL and step % 10 == 0:
+                print(safety_filter.summary_line(risk_level, sf_info))
+
+    except CrashError as e:
+        print(f"\n{'='*60}")
+        print(f"  SIMULATION TERMINATED: {e}")
+        print(f"{'='*60}\n")
+
     finally:
         if env is not None:
             env.__del__()
+
 
 if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
         print('Exit by user')
-
-
-# -------------------------------------------- OLD CODE
-        
-
-        # # 2. Get the Map for waypoint generation
-        # carla_map = env.world.get_map()
-
-        # spectator = env.world.get_spectator()
-        # spectator.set_transform(carla.Transform(carla.Location(x=0, y=0, z=50),carla.Rotation(pitch=-90)))
-
-        # tic = 0
-        # target_speed = 20.0 # km/h or m/s depending on your controller logic
-        
-        # while running:
-        #     tic += 1
-        #     env.world.tick()
-            
-        #     # 3. Get Current Vehicle State
-        #     car_model.update() # CRITICAL: Update the vehicle model with current state for MPC
-        #     vehicle_transform = env.ego_car.get_transform()
-            
-        #     # 4. Find the Next Waypoint
-        #     # We need to look far enough ahead for the MPC to have a stable target
-        #     current_waypoint = env.world.get_map().get_waypoint(vehicle_transform.location, project_to_road=True)
-            
-        #     # Simple Logic: Follow the lane. 
-        #     # If we are on the roundabout, next(dist) usually gives the next point on circle.
-        #     next_waypoints = current_waypoint.next(7.0) # Look 5m ahead
-
-        #     if next_waypoints:
-        #          target_wp = next_waypoints[0]
-        #          target_loc = target_wp.transform.location
-                 
-        #          # Prepare state for MPC: (x, y, yaw in degrees)
-        #          # Note: CARLA yaw is in degrees, MPC might expect radians depending on implementation.
-        #          # Usually this specific MPC implementation expects degrees based on main_intersection.py
-        #          target_state = (target_loc.x, target_loc.y, target_wp.transform.rotation.yaw)
-                 
-        #          try:
-        #              # Calculate control
-        #              control_cmd = ego_controller.solve(target_state, target_speed)
-                     
-        #              # Apply Control
-        #              env.ego_car.apply_control(control_cmd)
-        #          except Exception as e:
-        #              print(f"Controller Failed: {e}")
-        #              # Emergency brake if controller determines infeasiblity
-        #              env.ego_car.apply_control(carla.VehicleControl(brake=1.0))
-
-        #     else:
-        #          print("End of leg!")
-        #          env.ego_car.apply_control(carla.VehicleControl(brake=1.0))
-            
-            # time.sleep(env.dt)
-
