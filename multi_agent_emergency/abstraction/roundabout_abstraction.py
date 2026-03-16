@@ -445,3 +445,104 @@ def frenet_to_cell_indices(
     i_s = int(np.clip(round((s - centres_s[0]) / cell_w_s), 0, len(centres_s) - 1))
     i_d = int(np.clip(round((d - centres_d[0]) / cell_w_d), 0, len(centres_d) - 1))
     return i_s, i_d
+
+
+# ---------------------------------------------------------------------------
+# Relative transition matrix builder
+# ---------------------------------------------------------------------------
+
+def _build_relative_transitions(
+    N: int,
+    dist_max: float,
+    dt: float,
+    speed_values: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Builds P_delta_s. Action v_s reduces the distance to the obstacle."""
+    nu = len(speed_values)
+    cell_w = dist_max / N
+    centres = np.linspace(cell_w / 2, dist_max - cell_w / 2, N)
+
+    P_flat = np.zeros((N, N * nu), dtype=float)
+
+    for a_idx, v in enumerate(speed_values):
+        for i in range(N):
+            # gap shrinks
+            next_delta_s = centres[i] - v * dt
+            # clip to avoid out of bounds (0 is collision, dist_max is safe)
+            next_delta_s = np.clip(next_delta_s, 0.0, dist_max - 1e-6)
+            j = int(np.clip(math.floor(next_delta_s / cell_w), 0, N - 1))
+            P_flat[i, a_idx * N + j] = 1.0
+
+    return P_flat, centres
+
+def build_relative_abstraction(
+    rmap,
+    dt: float = 0.05,
+    N_s: int = 10,
+    N_d: int = 8,
+    dist_max: float = 60.0,
+    v_s_max: float = 10.0,
+    v_d_max: float = 2.0,
+    n_speed_levels_s: int = 5,
+    n_speed_levels_d: int = 5,
+    k_speed: float = 0.5,
+    k_lat: float = 0.1,
+    collision_penalty: float = 50.0,
+    boundary_penalty: float = 50.0,
+    n_letters: int = 4,
+) -> Dict:
+    """Builds the relative-distance abstraction for the evasive policy."""
+    lane_width = rmap.lane_width
+    half_w = lane_width / 2.0
+    
+    acc_s = np.linspace(0.0, v_s_max, n_speed_levels_s)
+    acc_d = np.linspace(-v_d_max, v_d_max, n_speed_levels_d)
+
+    # Transition matrices
+    P_delta_s, centres_delta_s = _build_relative_transitions(
+        N=N_s, dist_max=dist_max, dt=dt, speed_values=acc_s
+    )
+    P_d, centres_d = _build_1d_transitions(
+        N=N_d, x_min=-half_w, x_max=half_w, dt=dt, speed_values=acc_d, wrap=False
+    )
+
+    # Labels
+    L_delta_s = np.zeros((n_letters, N_s), dtype=float)
+    L_delta_s[0, :] = 1.0  # safe by default
+    L_d = np.zeros((n_letters, N_d), dtype=float)
+    thresh = 0.85 * half_w
+    for i, d in enumerate(centres_d):
+        if abs(d) >= thresh:
+            L_d[1, i] = 1.0
+        else:
+            L_d[0, i] = 1.0
+
+    # Costs
+    state_cost_delta_s = np.zeros(N_s, dtype=float)
+    for i, ds in enumerate(centres_delta_s):
+        if ds < 10.0:
+            state_cost_delta_s[i] = collision_penalty * (1.0 - ds/10.0)
+    
+    action_cost_delta_s = -k_speed * acc_s.copy()
+    
+    state_cost_d = np.zeros(N_d, dtype=float)
+    for i, d in enumerate(centres_d):
+        state_cost_d[i] = -1.0 + (boundary_penalty - (-1.0)) * (abs(d)/half_w)**2
+    action_cost_d = k_lat * np.abs(acc_d)
+
+    return {
+        'P_s': P_delta_s,
+        'P_d': P_d,
+        'centres_s': centres_delta_s,
+        'centres_d': centres_d,
+        'L_s': L_delta_s,
+        'L_d': L_d,
+        'state_cost_s': state_cost_delta_s,
+        'action_cost_s': action_cost_delta_s,
+        'state_cost_d': state_cost_d,
+        'action_cost_d': action_cost_d,
+        'acc_s': acc_s,
+        'acc_d': acc_d,
+        'graph': LaneletGraph(rmap.n_sections, rmap.n_lanes, [], rmap.inner_radius, lane_width)
+    }
+

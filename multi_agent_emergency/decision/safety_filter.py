@@ -195,16 +195,17 @@ class SafetyFilter:
         return RiskLevel.NOMINAL, info
 
     # ------------------------------------------------------------------
-    # Speed override
+    # Policy Selection (Supervisory Control)
     # ------------------------------------------------------------------
 
-    def filter_speed(self, v_s_nominal: float, level: RiskLevel) -> float:
-        """Adjust speed based on risk level."""
-        if level == RiskLevel.BRAKE:
-            return 0.0
-        elif level == RiskLevel.CAUTION:
-            return v_s_nominal * self.caution_speed_factor
-        return v_s_nominal
+    def choose_policy(self, ped_distance: float = None, lookahead_distance: float = 60.0) -> str:
+        """
+        Acts as a Supervisory Controller.
+        Chooses which DP policy to execute based on sensor lookahead.
+        """
+        if ped_distance is not None and ped_distance <= lookahead_distance:
+            return 'evasive'
+        return 'nominal'
 
     # ------------------------------------------------------------------
     # Lane suggestion using DFA risk costs

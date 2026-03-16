@@ -18,15 +18,15 @@ Single-car roundabout scenario using:
 
 Architecture
 ------------
-    ┌───────────────┐     ┌────────────────────┐     ┌──────────────┐
-    │ Roundabout     │────▶│ DFATree DP         │────▶│ MPC Tracker  │
+    ┌───────────────┐     ┌────────────────────┐     ┌───────────────┐
+    │ Roundabout     │────▶│ DFATree DP         │────▶│ MPC Tracker │
     │ Lanelet Map    │     │ (offline, 1 tree)  │     │ (CARLA)      │
-    └───────────────┘     └────────────────────┘     └──────────────┘
-          ▲                        │                      ▲
-          │  Frenet (s,d)         │ (v_s,v_d) policy     │
-          └────────────────────────┘                      │
-                                                          │
-                              ┌──────────────┐            │
+    └───────────────┘     └────────────────────┘     └───────────────┘
+          ▲                        │                       ▲
+          │  Frenet (s,d)         │ (v_s,v_d) policy       │
+          └────────────────────────┘                       │
+                                                           │
+                              ┌──────────────┐             │
                               │ Safety Filter │────────────┘
                               │ (crash costs) │  override speed/lane
                               └──────────────┘
@@ -61,7 +61,7 @@ import control.vehicle_model as model
 from control.trackingMPC import MPC_controller
 
 from abstraction.roundabout_lanelets import RoundaboutLaneletMap
-from abstraction.roundabout_abstraction import build_abstraction, LaneletGraph
+from abstraction.roundabout_abstraction import build_abstraction, build_relative_abstraction, LaneletGraph
 
 from decision.specification.roundabout_dfa import RoundaboutDFA
 from decision.maker_roundabout_dp import RoundaboutDPDecisionMaker
@@ -246,14 +246,15 @@ def main():
         # =================================================================
         #  4. OFFLINE: BUILD ABSTRACTION + SOLVE DFATree (ONCE)
         # =================================================================
-        abs_data = build_abstraction(
+        print("[DP] Building nominal abstraction...")
+        abs_data_nominal = build_abstraction(
             rmap=rmap,
             ref_lane=DRIVE_LANE,
             drivable_lanes=DRIVABLE_LANES,
             dt=DT_DP,
             N_s=N_S,
             N_d=N_D,
-            N_p=N_P,
+            N_p=1, # no ped grid
             v_s_max=V_S_MAX,
             v_d_max=V_D_MAX,
             n_speed_levels_s=N_SPEED_S,
@@ -266,20 +267,39 @@ def main():
             ped_on_road_penalty=PED_PENALTY,
             n_letters=4,
         )
+        
+        print("[DP] Building evasive abstraction...")
+        abs_data_evasive = build_relative_abstraction(
+            rmap=rmap,
+            dt=DT_DP,
+            N_s=N_S,
+            N_d=N_D,
+            dist_max=120.0,
+            v_s_max=V_S_MAX,
+            v_d_max=V_D_MAX,
+            n_speed_levels_s=N_SPEED_S,
+            n_speed_levels_d=N_SPEED_D,
+            k_speed=K_SPEED,
+            k_lat=K_LAT,
+            collision_penalty=PED_PENALTY,
+            boundary_penalty=EDGE_PENALTY,
+            n_letters=4,
+        )
 
         dfa = RoundaboutDFA()
         print(dfa.summary())
 
         maker = RoundaboutDPDecisionMaker(
             dfa=dfa,
-            abs_data=abs_data,
+            abs_data_nominal=abs_data_nominal,
+            abs_data_evasive=abs_data_evasive,
             gamma=GAMMA,
             n_tree_iters=N_TREE_ITERS,
             n_vi_per_iter=N_VI_PER_ITER,
             n_grow=N_GROW,
         )
 
-        graph = abs_data['graph']
+        graph = abs_data_nominal['graph']
 
         # =================================================================
         #  5. SAFETY FILTER
@@ -434,11 +454,18 @@ def main():
                 raise CrashError(
                     f"DFA entered fail state (label='{dfa_label}')")
 
-            # --- DP policy lookup ---
-            v_s, v_d = maker.get_action(s_ego, d_ego)
+            # --- Supervisory Control: Choose Policy ---
+            policy_dist = min([ped.distance for ped in peds_in_sys]) if peds_in_sys else None
+            policy_type = safety_filter.choose_policy(policy_dist, lookahead_distance=60.0)
 
-            # --- Safety filter overrides ---
-            v_s_safe = safety_filter.filter_speed(v_s, risk_level)
+            # --- DP policy lookup ---
+            if policy_type == 'evasive' and policy_dist is not None:
+                v_s, v_d = maker.get_action(policy_dist, d_ego, policy_type='evasive')
+            else:
+                v_s, v_d = maker.get_action(s_ego, d_ego, policy_type='nominal')
+
+            # --- Safety filter warnings/lanes (kept for auxiliary steering logic) ---
+            v_s_safe = v_s # Overrides removed; DP policy gives correct speed
             target_lane = safety_filter.suggest_lane(
                 current_lane, risk_level,
                 ped_on_lane=ped_lane, ped_distance=ped_dist,
@@ -459,7 +486,12 @@ def main():
 
             # dp_action for MPC reference (uses filtered speed)
             def dp_action_filtered(s: float, d: float):
-                _, v_d_nom = maker.get_action(s, d)
+                # When evasive, just use the current v_d_nom for simplicity instead of re-evaluating
+                if policy_type == 'evasive' and policy_dist is not None:
+                    _, v_d_nom = maker.get_action(policy_dist, d, policy_type='evasive')
+                else:
+                    _, v_d_nom = maker.get_action(s, d, policy_type='nominal')
+                
                 v_d_use = dp_v_d_override if dp_v_d_override is not None else v_d_nom
                 return v_s_safe, v_d_use
 

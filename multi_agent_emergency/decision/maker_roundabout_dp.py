@@ -57,24 +57,32 @@ class RoundaboutDPDecisionMaker:
     def __init__(
         self,
         dfa,
-        abs_data: Dict,
+        abs_data_nominal: Dict,
+        abs_data_evasive: Dict,
         gamma: float = 0.5,
         n_tree_iters: int = 3,
         n_vi_per_iter: int = 10,
         n_grow: int = 2,
     ) -> None:
         self.dfa = dfa
-        self.abs_data = abs_data
+        self.abs_data_nominal = abs_data_nominal
+        self.abs_data_evasive = abs_data_evasive
         self.gamma = gamma
 
-        # Unpack abstraction
-        self.acc_s = abs_data['acc_s']
-        self.acc_d = abs_data['acc_d']
-        self.centres_s = abs_data['centres_s']
-        self.centres_d = abs_data['centres_d']
+        # Unpack abstraction - use evasive/nominal identically since grids match
+        self.acc_s = abs_data_nominal['acc_s']
+        self.acc_d = abs_data_nominal['acc_d']
+        self.centres_s = abs_data_nominal['centres_s']
+        self.centres_d = abs_data_nominal['centres_d']
+        
+        self.centres_evasive_s = abs_data_evasive['centres_s']
+        self.centres_evasive_d = abs_data_evasive['centres_d']
 
-        # Build the single DFATree (offline)
-        self.tree = self._build_tree(n_tree_iters, n_vi_per_iter, n_grow)
+        # Build two DFATrees (offline)
+        print("[DP] Building nominal tree...")
+        self.tree_nominal = self._build_tree(self.abs_data_nominal, n_tree_iters, n_vi_per_iter, n_grow)
+        print("[DP] Building evasive tree...")
+        self.tree_evasive = self._build_tree(self.abs_data_evasive, n_tree_iters, n_vi_per_iter, n_grow)
 
         # Current DFA state (for online tracking)
         self.q_current: int = dfa.S0
@@ -85,12 +93,13 @@ class RoundaboutDPDecisionMaker:
 
     def _build_tree(
         self,
+        abs_data: Dict,
         n_tree_iters: int,
         n_vi_per_iter: int,
         n_grow: int,
     ) -> DFATree:
         """Build and solve a single DFATree from the abstraction."""
-        d = self.abs_data
+        d = abs_data
         N_s = len(d['centres_s'])
         N_d = len(d['centres_d'])
 
@@ -157,7 +166,7 @@ class RoundaboutDPDecisionMaker:
     # Online: policy lookup  (no online solving)
     # ------------------------------------------------------------------
 
-    def get_action(self, s: float, d: float) -> Tuple[float, float]:
+    def get_action(self, s: float, d: float, policy_type: str = 'nominal') -> Tuple[float, float]:
         """
         Look up the offline policy at Frenet state (s, d).
 
@@ -167,11 +176,17 @@ class RoundaboutDPDecisionMaker:
         if q == int(self.dfa.sink):
             return 0.0, 0.0
 
-        i_s = self._to_index(s, self.centres_s)
-        i_d = self._to_index(d, self.centres_d)
+        if policy_type == 'evasive':
+            tree = self.tree_evasive
+            i_s = self._to_index(s, self.centres_evasive_s)
+            i_d = self._to_index(d, self.centres_evasive_d)
+        else:
+            tree = self.tree_nominal
+            i_s = self._to_index(s, self.centres_s)
+            i_d = self._to_index(d, self.centres_d)
 
-        pol_s = self.tree.pol[q][0]
-        pol_d = self.tree.pol[q][1]
+        pol_s = tree.pol[q][0]
+        pol_d = tree.pol[q][1]
 
         if hasattr(pol_s, 'toarray'):
             pol_s = pol_s.toarray()
@@ -183,7 +198,7 @@ class RoundaboutDPDecisionMaker:
 
         return float(self.acc_s[a_s]), float(self.acc_d[a_d])
 
-    def get_value(self, s: float, d: float) -> float:
+    def get_value(self, s: float, d: float, policy_type: str = 'nominal') -> float:
         """
         Query the risk value at Frenet state (s, d).
 
@@ -196,14 +211,20 @@ class RoundaboutDPDecisionMaker:
         if q == int(self.dfa.sink):
             return float('inf')
 
-        i_s = self._to_index(s, self.centres_s)
-        i_d = self._to_index(d, self.centres_d)
+        if policy_type == 'evasive':
+            tree = self.tree_evasive
+            i_s = self._to_index(s, self.centres_evasive_s)
+            i_d = self._to_index(d, self.centres_evasive_d)
+        else:
+            tree = self.tree_nominal
+            i_s = self._to_index(s, self.centres_s)
+            i_d = self._to_index(d, self.centres_d)
 
         total = 0.0
-        for n in self.tree.Q.get(q, []):
+        for n in tree.Q.get(q, []):
             if n == 0:          # root: V = 0, skip for clarity
                 continue
-            total += float(self.tree.V[0][n, i_s]) * float(self.tree.V[1][n, i_d])
+            total += float(tree.V[0][n, i_s]) * float(tree.V[1][n, i_d])
         return total
 
     def update_dfa_state(self, label: str) -> int:
