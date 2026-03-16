@@ -112,18 +112,20 @@ class LaneletGraph:
                 result.append(adj)
         return result
 
-    def adjacent_drivable_lanes(self, lane_id: int) -> List[int]:
-        """Return drivable lanes adjacent to lane_id."""
-        return [l for l in self.adjacent_lanes(lane_id)
-                if l in self.drivable_lanes]
+    # %% REDUNDANT %%
+#     def adjacent_drivable_lanes(self, lane_id: int) -> List[int]:
+#         """Return drivable lanes adjacent to lane_id."""
+#         return [l for l in self.adjacent_lanes(lane_id)
+#                 if l in self.drivable_lanes]
 
-    def s_in_adjacent_lane(
-        self, s_current: float, current_lane: int, target_lane: int,
-    ) -> float:
-        """Map *s* from current_lane to target_lane (same angular position)."""
-        r_cur = self.inner_radius + (current_lane + 0.5) * self.lane_width
-        r_tgt = self.inner_radius + (target_lane + 0.5) * self.lane_width
-        return s_current * (r_tgt / r_cur)
+    # %% REDUNDANT %%
+#     def s_in_adjacent_lane(
+#         self, s_current: float, current_lane: int, target_lane: int,
+#     ) -> float:
+#         """Map *s* from current_lane to target_lane (same angular position)."""
+#         r_cur = self.inner_radius + (current_lane + 0.5) * self.lane_width
+#         r_tgt = self.inner_radius + (target_lane + 0.5) * self.lane_width
+#         return s_current * (r_tgt / r_cur)
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +510,11 @@ def build_relative_abstraction(
 
     # Labels
     L_delta_s = np.zeros((n_letters, N_s), dtype=float)
-    L_delta_s[0, :] = 1.0  # safe by default
+    for i, ds in enumerate(centres_delta_s):
+        if ds < 30.0:
+            L_delta_s[2, i] = 1.0  # pedestrian label
+        else:
+            L_delta_s[0, i] = 1.0  # safe normally
     L_d = np.zeros((n_letters, N_d), dtype=float)
     thresh = 0.85 * half_w
     for i, d in enumerate(centres_d):
@@ -520,8 +526,8 @@ def build_relative_abstraction(
     # Costs
     state_cost_delta_s = np.zeros(N_s, dtype=float)
     for i, ds in enumerate(centres_delta_s):
-        if ds < 10.0:
-            state_cost_delta_s[i] = collision_penalty * (1.0 - ds/10.0)
+        if ds < 30.0:
+            state_cost_delta_s[i] = collision_penalty * (1.0 - ds/30.0)
     
     action_cost_delta_s = -k_speed * acc_s.copy()
     

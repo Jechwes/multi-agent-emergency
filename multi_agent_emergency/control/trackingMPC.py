@@ -8,7 +8,7 @@ class MPC_controller:
     def __init__(self, car_model):
 
         self.dt = 0.1 # time step
-        self.horizon = 10
+        self.horizon = 5
         self.WB = car_model.wheelbase
         self.car = car_model
 

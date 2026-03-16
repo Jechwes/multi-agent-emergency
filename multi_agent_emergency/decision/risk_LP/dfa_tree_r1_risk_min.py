@@ -433,7 +433,9 @@ class DFATree:
 
             mask_row = np.asarray(self.L[d][l, :], dtype=float).reshape(1, -1)
             v_parent_row = np.asarray(self.V[d][nparent, :], dtype=float).reshape(1, -1)
-            w = mask_row * v_parent_row  # (1, N)
+            cost_d = np.asarray(self.cost_map[d]).reshape(1, -1)
+            v_with_cost = v_parent_row + cost_d
+            w = mask_row * (self.gamma * v_with_cost)  # (1, N)
 
             if self.sysAbs[d].dim == 1:
                 P_flat = P_attr  # (N, N*nu)
@@ -489,7 +491,9 @@ class DFATree:
                 nu = P_flat.shape[1] // N
                 mask_row = np.asarray(self.L[d][l, :], dtype=float).reshape(1, -1)
                 v_parent_row = np.asarray(self.V[d][nparent, :], dtype=float).reshape(1, -1)
-                w = mask_row * v_parent_row
+                cost_d = np.asarray(self.cost_map[d]).reshape(1, -1)
+                v_with_cost = v_parent_row + cost_d
+                w = mask_row * (self.gamma * v_with_cost)
                 prod = np.asfortranarray(w) @ P_flat
                 Qv_d = np.reshape(prod, (N, nu), order='F')
                 # Qv_d = np.maximum(Qv_d - 0.001, 0.0)
@@ -499,7 +503,9 @@ class DFATree:
                 nu = P_attr.a
                 mask_row = np.asarray(self.L[d][l, :], dtype=float).reshape(1, -1)
                 v_parent_row = np.asarray(self.V[d][nparent, :], dtype=float).reshape(1, -1)
-                w = mask_row * v_parent_row
+                cost_d = np.asarray(self.cost_map[d]).reshape(1, -1)
+                v_with_cost = v_parent_row + cost_d
+                w = mask_row * (self.gamma * v_with_cost)
                 # EQUIVALENCE: prod = P_attr.mtimes( np.asfortranarray(w)  )
                 prod = np.asfortranarray(w) @ P_attr.stoch
                 Qv_d = np.reshape(prod, (N, nu), order='F')

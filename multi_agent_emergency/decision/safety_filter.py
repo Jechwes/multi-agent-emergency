@@ -99,6 +99,7 @@ class SafetyFilter:
         current_lane: int,
         ped_distance: Optional[float] = None,
         ped_on_lane: Optional[int] = None,
+        ped_target_lane: Optional[int] = None,
         car_distance: Optional[float] = None,
         car_on_lane: Optional[int] = None,
         collision_radius: float = 1.5,
@@ -148,15 +149,28 @@ class SafetyFilter:
         )
 
         # ---- Proximity-based threat assessment ----
-        # Threat is only raised if the obstacle is on the SAME lane.
-        # Adjacent-lane obstacles are handled by the lane-suggestion
-        # logic (don't switch into them) but don't slow the car down.
-        ped_on_same_lane = (ped_on_lane is not None
-                            and ped_on_lane == current_lane)
+        ped_is_threat = False
+        if ped_on_lane is not None:
+            if ped_on_lane in self.drivable_lanes:
+                ped_is_threat = True
+            elif ped_target_lane is not None:
+                # If pedestrian is outside the drivable lanes but moving towards them
+                min_drivable = min(self.drivable_lanes) if self.drivable_lanes else current_lane
+                max_drivable = max(self.drivable_lanes) if self.drivable_lanes else current_lane
+                
+                if ped_on_lane > max_drivable and ped_target_lane < ped_on_lane:
+                    ped_is_threat = True
+                elif ped_on_lane < min_drivable and ped_target_lane > ped_on_lane:
+                    ped_is_threat = True
+                else:
+                    ped_is_threat = False
+            else:
+                ped_is_threat = False
+
         car_on_same_lane = (car_on_lane is not None
                             and car_on_lane == current_lane)
 
-        ped_close = (ped_on_same_lane and ped_distance is not None
+        ped_close = (ped_is_threat and ped_distance is not None
                      and ped_distance < self.warn_distance)
         car_close = (car_on_same_lane and car_distance is not None
                      and car_distance < self.warn_distance)
@@ -181,7 +195,7 @@ class SafetyFilter:
         }
 
         # --- BRAKE: obstacle within brake distance on SAME lane
-        if (ped_on_same_lane and ped_distance is not None
+        if (ped_is_threat and ped_distance is not None
                 and ped_distance < self.brake_distance):
             return RiskLevel.BRAKE, info
         if (car_on_same_lane and car_distance is not None
@@ -255,10 +269,18 @@ class SafetyFilter:
         # CAUTION → only suggest lane change if far enough away
         # Determine the nearest threat distance
         threat_dist = float('inf')
-        if ped_distance is not None:
-            threat_dist = min(threat_dist, ped_distance)
+        
+        # Always stay in lane for pedestrians (brake instead of swerving).
+        # Swerving is only considered for car threats.
         if car_distance is not None:
             threat_dist = min(threat_dist, car_distance)
+
+        if threat_dist == float('inf'):
+            # Threat is pedestrian or non-drivable lane.
+            # If off-road, recover gracefully. Otherwise stay put.
+            if current_lane not in self.drivable_lanes:
+                return min(self.drivable_lanes, key=lambda l: abs(l - current_lane))
+            return current_lane
 
         if threat_dist < self.lane_change_distance:
             # Too close — stay straight, brake will handle it

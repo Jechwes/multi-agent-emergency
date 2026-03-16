@@ -139,7 +139,7 @@ def main():
     LANE_WIDTH   = 4.0
     N_LANES      = 4
     N_SECTIONS   = 12
-    DRIVE_LANE   = 1          # initial lane (drivable inner = 1, outer = 2)
+    DRIVE_LANE   = 2          # initial lane (drivable inner = 1, outer = 2)
     DIRECTION    = "cw"
 
     # DP grid
@@ -157,7 +157,7 @@ def main():
     PED_WAIT_AT_EDGE = 1.0
 
     # DP parameters
-    DT_DP        = 0.05
+    DT_DP        = 0.1
     GAMMA        = 0.5
     K_SPEED      = 0.5
     K_LAT        = 0.1
@@ -172,7 +172,7 @@ def main():
 
     # Safety filter
     SF_WARN_DIST     = 20.0       # pedestrian warning distance [m]
-    SF_BRAKE_DIST    = 8.0        # pedestrian brake distance [m]
+    SF_BRAKE_DIST    = 10.0        # pedestrian brake distance [m]
     SF_CAUTION_FACTOR = 0.4
     COLLISION_RADIUS = 1        # collision detection radius [m]
 
@@ -320,7 +320,7 @@ def main():
         # ---------------------------------------------------------------
         # Pedestrian distance helper
         # ---------------------------------------------------------------
-        PED_ANGLE_AHEAD  = math.radians(45)
+        PED_ANGLE_AHEAD  = math.radians(180)
         PED_ANGLE_BEHIND = math.radians(8)
 
         _prev_ped_r = None
@@ -426,7 +426,14 @@ def main():
             # --- Pedestrian info ---
             ped_dist, ped_lane, ped_target_lane = _get_ped_info(ego_xy)
 
-            # --- Collision detection ---
+            # True Euclidean pedestrian collision check
+            if env.pedestrian is not None:
+                ped_loc = env.pedestrian.get_location()
+                dist_xy = math.hypot(ego_xy[0] - ped_loc.x, ego_xy[1] - ped_loc.y)
+                if dist_xy < COLLISION_RADIUS:
+                    raise CrashError("Crashed into pedestrian (label: 'pedestrian')")
+
+            # --- Collision detection (other hazards) ---
             crash_msg = safety_filter.check_collision(
                 d_ego, current_lane,
                 ped_distance=ped_dist, ped_on_lane=ped_lane,
@@ -439,6 +446,7 @@ def main():
             risk_level, sf_info = safety_filter.evaluate(
                 d_ego, current_lane,
                 ped_distance=ped_dist, ped_on_lane=ped_lane,
+                ped_target_lane=ped_target_lane,
                 collision_radius=COLLISION_RADIUS,
             )
 
@@ -455,7 +463,7 @@ def main():
                     f"DFA entered fail state (label='{dfa_label}')")
 
             # --- Supervisory Control: Choose Policy ---
-            policy_dist = min([ped.distance for ped in peds_in_sys]) if peds_in_sys else None
+            policy_dist = ped_dist
             policy_type = safety_filter.choose_policy(policy_dist, lookahead_distance=60.0)
 
             # --- DP policy lookup ---
@@ -472,13 +480,6 @@ def main():
                 ped_target_lane=ped_target_lane,
             )
 
-            # If staying in current lane during CAUTION/BRAKE, force
-            # v_d = 0 so the MPC keeps the car straight (no diagonal).
-            if target_lane == current_lane and risk_level != RiskLevel.NOMINAL:
-                dp_v_d_override = 0.0
-            else:
-                dp_v_d_override = None   # use DP's v_d
-
             # If lane change was decided, give the car enough speed to
             # actually complete the manoeuvre (don't crawl sideways)
             if target_lane != current_lane:
@@ -492,8 +493,7 @@ def main():
                 else:
                     _, v_d_nom = maker.get_action(s, d, policy_type='nominal')
                 
-                v_d_use = dp_v_d_override if dp_v_d_override is not None else v_d_nom
-                return v_s_safe, v_d_use
+                return v_s_safe, v_d_nom
 
             # --- Build MPC reference trajectory ---
             ref_traj = build_mpc_reference(

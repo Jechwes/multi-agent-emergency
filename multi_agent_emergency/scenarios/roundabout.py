@@ -192,11 +192,19 @@ class Environment:
 
     def __del__(self):
         # Destroy pedestrian + controller first
-        if self.ped_controller is not None:
-            self.ped_controller.stop()
-            self.ped_controller.destroy()
-        if self.pedestrian is not None:
-            self.pedestrian.destroy()
-        self.world.apply_settings(self.original_settings)
+        if getattr(self, 'ped_controller', None) is not None:
+            try:
+                if getattr(self.ped_controller, 'is_alive', True):
+                    self.ped_controller.stop()
+                self.ped_controller.destroy()
+            except RuntimeError:
+                pass
+        if getattr(self, 'pedestrian', None) is not None:
+            try:
+                self.pedestrian.destroy()
+            except RuntimeError:
+                pass
+        if getattr(self, 'world', None) is not None and getattr(self, 'original_settings', None) is not None:
+            self.world.apply_settings(self.original_settings)
         print('done')
 
