@@ -129,8 +129,51 @@ class LaneletGraph:
 
 
 # ---------------------------------------------------------------------------
-# 1-D deterministic transition matrix builder
+# 1-D transition matrix builder (stochastic)
 # ---------------------------------------------------------------------------
+
+def _distribute_transition_probability(
+    P_flat: np.ndarray,
+    i: int,
+    a_idx: int,
+    N: int,
+    j_main: int,
+    noise: float,
+    wrap: bool,
+) -> None:
+    """
+    Write one action-conditioned transition row with local process noise.
+
+    Probability mass is split between the nominal successor cell and its
+    immediate neighbors. This keeps transitions local and preserves
+    stochastic consistency required by DP.
+    """
+    noise = float(np.clip(noise, 0.0, 0.49))
+    p_main = 1.0 - 2.0 * noise
+    col_offset = a_idx * N
+
+    neighbors = [j_main - 1, j_main + 1]
+    if wrap:
+        neighbors = [n % N for n in neighbors]
+
+    p_left = noise
+    p_right = noise
+
+    if not wrap:
+        if neighbors[0] < 0:
+            p_main += p_left
+            p_left = 0.0
+            neighbors[0] = j_main
+        if neighbors[1] >= N:
+            p_main += p_right
+            p_right = 0.0
+            neighbors[1] = j_main
+
+    P_flat[i, col_offset + j_main] += p_main
+    if p_left > 0.0:
+        P_flat[i, col_offset + neighbors[0]] += p_left
+    if p_right > 0.0:
+        P_flat[i, col_offset + neighbors[1]] += p_right
 
 def _build_1d_transitions(
     N: int,
@@ -138,14 +181,15 @@ def _build_1d_transitions(
     x_max: float,
     dt: float,
     speed_values: np.ndarray,
+    process_noise: float = 0.08,
     wrap: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Build a deterministic transition matrix for a 1-D single-integrator.
+    Build a stochastic transition matrix for a 1-D single-integrator.
 
     Returns
     -------
-    P_flat  : (N, N*nu) deterministic transition matrix.
+    P_flat  : (N, N*nu) action-conditioned transition matrix.
     centres : (N,) cell centres.
     """
     nu = len(speed_values)
@@ -160,7 +204,15 @@ def _build_1d_transitions(
             if wrap:
                 x_next = x_min + (x_next - x_min) % (x_max - x_min)
             j = int(np.clip(round((x_next - centres[0]) / cell_w), 0, N - 1))
-            P_flat[i, a_idx * N + j] = 1.0
+            _distribute_transition_probability(
+                P_flat=P_flat,
+                i=i,
+                a_idx=a_idx,
+                N=N,
+                j_main=j,
+                noise=process_noise,
+                wrap=wrap,
+            )
 
     return P_flat, centres
 
@@ -348,6 +400,8 @@ def build_abstraction(
     road_reward: float = -1.0,
     boundary_penalty: float = 50.0,
     p_move: float = 0.3,
+    process_noise_s: float = 0.08,
+    process_noise_d: float = 0.08,
     ped_on_road_penalty: float = 50.0,
     n_letters: int = 4,
 ) -> Dict:
@@ -382,11 +436,11 @@ def build_abstraction(
     # Transition matrices  (built once for ref_lane)
     P_s, centres_s = _build_1d_transitions(
         N=N_s, x_min=0.0, x_max=arc_length,
-        dt=dt, speed_values=acc_s, wrap=True,
+        dt=dt, speed_values=acc_s, process_noise=process_noise_s, wrap=True,
     )
     P_d, centres_d = _build_1d_transitions(
         N=N_d, x_min=-half_w, x_max=half_w,
-        dt=dt, speed_values=acc_d, wrap=False,
+        dt=dt, speed_values=acc_d, process_noise=process_noise_d, wrap=False,
     )
 
     # Labels
@@ -458,8 +512,9 @@ def _build_relative_transitions(
     dist_max: float,
     dt: float,
     speed_values: np.ndarray,
+    process_noise: float = 0.08,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Builds P_delta_s. Action v_s reduces the distance to the obstacle."""
+    """Build stochastic P_delta_s. Action v_s reduces obstacle distance."""
     nu = len(speed_values)
     cell_w = dist_max / N
     centres = np.linspace(cell_w / 2, dist_max - cell_w / 2, N)
@@ -473,7 +528,15 @@ def _build_relative_transitions(
             # clip to avoid out of bounds (0 is collision, dist_max is safe)
             next_delta_s = np.clip(next_delta_s, 0.0, dist_max - 1e-6)
             j = int(np.clip(math.floor(next_delta_s / cell_w), 0, N - 1))
-            P_flat[i, a_idx * N + j] = 1.0
+            _distribute_transition_probability(
+                P_flat=P_flat,
+                i=i,
+                a_idx=a_idx,
+                N=N,
+                j_main=j,
+                noise=process_noise,
+                wrap=False,
+            )
 
     return P_flat, centres
 
@@ -491,6 +554,8 @@ def build_relative_abstraction(
     k_lat: float = 0.1,
     collision_penalty: float = 50.0,
     boundary_penalty: float = 50.0,
+    process_noise_s: float = 0.08,
+    process_noise_d: float = 0.08,
     n_letters: int = 4,
 ) -> Dict:
     """Builds the relative-distance abstraction for the evasive policy."""
@@ -502,10 +567,20 @@ def build_relative_abstraction(
 
     # Transition matrices
     P_delta_s, centres_delta_s = _build_relative_transitions(
-        N=N_s, dist_max=dist_max, dt=dt, speed_values=acc_s
+        N=N_s,
+        dist_max=dist_max,
+        dt=dt,
+        speed_values=acc_s,
+        process_noise=process_noise_s,
     )
     P_d, centres_d = _build_1d_transitions(
-        N=N_d, x_min=-half_w, x_max=half_w, dt=dt, speed_values=acc_d, wrap=False
+        N=N_d,
+        x_min=-half_w,
+        x_max=half_w,
+        dt=dt,
+        speed_values=acc_d,
+        process_noise=process_noise_d,
+        wrap=False,
     )
 
     # Labels

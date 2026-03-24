@@ -34,7 +34,7 @@ _FMTENS_DIR = os.path.abspath(os.path.join(
 if _FMTENS_DIR not in sys.path:
     sys.path.insert(0, _FMTENS_DIR)
 
-from decision.risk_LP.dfa_tree_r1_risk_min import DFATree
+from decision.dfa_tree_r1_risk_min import DFATree
 from abstraction.roundabout_abstraction import SysAbs1D
 
 
