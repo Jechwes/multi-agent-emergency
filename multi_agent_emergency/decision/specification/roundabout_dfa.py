@@ -168,7 +168,9 @@ class RoundaboutDFA:
 
     def label_to_column(self, label: str) -> int:
         """Map a cell label string to the transition-table column index."""
-        return self._label_to_col.get(label, 0)   # default → 'safe'
+        if label not in self._label_to_col:
+            raise KeyError(f"Unknown DFA label '{label}'. Valid labels: {list(self._label_to_col)}")
+        return self._label_to_col[label]
 
     def next_state(self, q: int, label: str) -> int:
         """Deterministic DFA transition."""

@@ -40,11 +40,12 @@ class Vehicle:
         self.yaw = math.atan2(fwd.y, fwd.x)
 
     def predict(self, a, delta):
-        '''Bicycle Model for vehicles'''
-        self.x += self.v * math.cos(self.yaw) * self.dt
-        self.y += self.v * math.sin(self.yaw) * self.dt
-        self.yaw += self.v / self.wheelbase * math.tan(delta) * self.dt
-        self.v += a * self.dt
+        '''Bicycle Model for vehicles. Returns predicted (x, y, yaw, v) without mutating state.'''
+        x   = self.x + self.v * math.cos(self.yaw) * self.dt
+        y   = self.y + self.v * math.sin(self.yaw) * self.dt
+        yaw = self.yaw + self.v / self.wheelbase * math.tan(delta) * self.dt
+        v   = self.v + a * self.dt
+        return x, y, yaw, v
 
     def get_local_state(self):
         return np.array([self.x - self.origin_point.x + np.cos(self.yaw) * self.wheelbase/2,

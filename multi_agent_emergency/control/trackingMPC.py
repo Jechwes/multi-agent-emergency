@@ -83,22 +83,7 @@ class MPC_controller:
         opts = {'ipopt': {'print_level': 0}, 'print_time': False}
         self.opti.solver('ipopt', opts)
 
-    def solve_2(self, ref_x, ref_y, ref_yaw, sp_coe):
-        self.car.update()
-        X_0 = np.array([self.car.x, self.car.y, self.car.v, self.car.yaw])
-        self.opti.set_value(self.X_0, X_0)
-        ref_traj = self.gen_ref_traj_2(ref_x, ref_y, ref_yaw, sp_coe)
-        self.opti.set_value(self.X_ref, ref_traj)
-        sol = self.opti.solve()
-
-        opt_states = sol.value(self.X)
-        opt_inputs = sol.value(self.U)
-        # TO ENABLE SOLVER OUTPUT: uncomment the line below
-        # print("opt_inputs", opt_inputs[:, 1])
-        return self.gen_cmd(opt_inputs[0, 1], opt_inputs[1, 1])
-
     def solve(self, target, des_speed):
-        self.car.update()
         X_0 = np.array([self.car.x, self.car.y, self.car.v, self.car.yaw])
         self.opti.set_value(self.X_0, X_0)
         ref_traj = self.gen_ref_traj(target, des_speed)
@@ -109,12 +94,12 @@ class MPC_controller:
         opt_inputs = sol.value(self.U)
         # TO ENABLE SOLVER OUTPUT: uncomment the line below
         # print("opt_inputs", opt_inputs[:, 1])
-        return self.gen_cmd(opt_inputs[0, 1], opt_inputs[1, 1])
+        return self.gen_cmd(opt_inputs[0, 0], opt_inputs[1, 0])
 
     def gen_cmd(self, acc_cmd, delta_cmd):
         cmd = carla.VehicleControl()
         cmd.steer = max(min(delta_cmd/self.delta_bound[1], 1), -1)
-        index = bisect.bisect(list(self.Acc_Table.keys()), abs(acc_cmd)/self.acc_bound[1])-1
+        index = max(0, bisect.bisect(list(self.Acc_Table.keys()), abs(acc_cmd)/self.acc_bound[1]) - 1)
 
         if acc_cmd < 0:
             cmd.throttle = 0
@@ -123,35 +108,6 @@ class MPC_controller:
             cmd.throttle = list(self.Acc_Table.values())[index]
             cmd.brake = 0
         return cmd
-
-    def gen_ref_traj_2(self, ref_x, ref_y, ref_yaw, sp_coe):
-        z_ref = np.zeros((self.x_dim, self.horizon))
-
-        z_ref[0, 0] = ref_x[0]
-        z_ref[1, 0] = ref_y[0]
-        z_ref[2, 0] = sp_coe[0]
-        z_ref[3, 0] = ref_yaw[0]
-
-        def calc_index(rx, ry, s_t):
-            dx = np.diff(rx)
-            dy = np.diff(ry)
-            ds = [math.sqrt(idx ** 2 + idy ** 2) for (idx, idy) in zip(dx, dy)]
-            s = [0]
-            s.extend(np.cumsum(ds))
-            return bisect.bisect(s, s_t) - 1
-
-        for i in range(1, self.horizon):
-            t = i * self.dt
-            v = sp_coe[0] + 2*sp_coe[1]*t + 3*sp_coe[2]*t**2 + 4*sp_coe[3]*t**3 + 5*sp_coe[4]*t**4
-            s = sp_coe[0] * t + 2 * sp_coe[1] * t ** 2 + sp_coe[2] * t ** 3 + sp_coe[3] * t ** 4 + sp_coe[4] * t ** 5
-            index = calc_index(ref_x, ref_y, s)
-
-            z_ref[0, i] = ref_x[index]
-            z_ref[1, i] = ref_y[index]
-            z_ref[2, i] = v
-            z_ref[3, i] = ref_yaw[index]
-
-        return z_ref
 
     def gen_ref_traj(self, target, des_speed):
         z_ref = np.zeros((self.x_dim, self.horizon))
@@ -178,7 +134,6 @@ class MPC_controller:
         -------
         carla.VehicleControl
         """
-        self.car.update()
         X_0 = np.array([self.car.x, self.car.y, self.car.v, self.car.yaw])
         self.opti.set_value(self.X_0, X_0)
         self.opti.set_value(self.X_ref, ref_traj_4xH)
