@@ -1,3 +1,19 @@
+"""
+trackingMPC.py
+==============
+MPC tracking controller for the CARLA ego vehicle.
+
+Uses a kinematic bicycle model (state: x, y, v, yaw; inputs: acceleration,
+steering angle) solved with CasADi/IPOPT over a fixed horizon of 5 steps
+at dt = 0.1 s.
+
+Two solve modes are provided:
+  - ``solve(target, des_speed)``      : tracks a single (x, y, yaw) target
+  - ``solve_trajectory(ref_traj_4xH)``: tracks a pre-built (4, H) reference
+
+The output is a ``carla.VehicleControl`` command applied directly to the
+ego actor each simulation tick.
+"""
 import math
 import casadi as ca
 import carla

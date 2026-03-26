@@ -14,13 +14,9 @@ own local Frenet coordinate system:
     s ∈ [0, L_section]    longitudinal progress within the section
     d ∈ [-w/2, +w/2]      lateral deviation from the centre-line
 
-The state vectors for the two decoupled MDPs are:
-
-    MDP_s  state: [s,  s_dot ]     (longitudinal)
-    MDP_d  state: [d,  d_dot ]     (lateral)
-
-This makes the transition matrices small (2-D each) and solvable by the
-FMTensJelmar dynprog algorithms.
+The MDP abstraction uses only (s, d) positions as state (1-D
+single-integrators); velocity is decomposed by ``to_frenet`` but is not
+part of the DP grid.
 
 Usage
 -----

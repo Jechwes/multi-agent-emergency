@@ -38,52 +38,23 @@ Transition table ``trans[q, letter] → q'``:
 DFA.F    = 0   (accepting=initial=safe, root of the DFA tree)
 DFA.sink = 1   (absorbing failure)
 
-DFA-tree structure
-------------------
-Because only ``trans[0, 0] = 0`` maps back to q_safe, ``initiate()``
-creates a single child of the root (q_safe, edge='safe').  Every
-``grow()`` call extends the chain by one node:
+Offline vs online use
+---------------------
+The DFATree is solved **offline** using only the 'safe' label mask (road
+geometry).  Since only ``trans[0,0]=0`` loops back to q_safe, the offline
+computation never needs to know where pedestrians or cars are.
 
-    root(q0) ──safe──▶ n₁(q0) ──safe──▶ n₂(q0) ──safe──▶  …
-
-The tree depth equals the safety look-ahead horizon.  At each level the
-value update applies:
-
-    V_n(s') = γ · L_safe(s') · [ V_parent(s') + c(s') ] · P^{π}
-
-so cells outside the 'safe' mask are zeroed, while the cost map c(s')
-creates a smooth risk-gradient inside the safe zone.
-
-Offline vs online labeling
---------------------------
-The DFATree is solved **offline** with static label masks (road
-geometry: which cells are drivable).  Since only letter 0 ('safe')
-loops back to q_safe, the tree only ever uses the 'safe' mask — the
-offline computation does not need to know where pedestrians or cars are.
-
-The 4-letter alphabet is used **online** by the safety filter and the
-DFA state tracker:
-  - ``classify_state()`` checks all three atomic propositions and
-    returns the appropriate letter.
-  - The safety filter uses the associated ``risk_cost`` to grade the
-    severity of different violations.
-  - The DFA state tracker advances ``q_current`` based on the label.
-
-This means the 4-letter alphabet adds **zero overhead** to the offline
-tree-solve while giving the online safety filter a direct connection
-to the temporal-logic specification.
+Online, ``classify_state()`` evaluates all three atomic propositions each
+tick and returns the appropriate letter.  The safety filter uses the
+associated ``risk_cost`` values to score proximity-based threats before
+any actual specification violation occurs.
 
 Risk-cost association
 ---------------------
-The ``risk_cost`` attribute maps each letter to a scalar cost:
-
-    'safe'          → 0.0        (no penalty)
-    'non_drivable'  → tuneable   (moderate penalty)
-    'pedestrian'    → tuneable   (high penalty)
-    'other_car'     → tuneable   (high penalty)
-
-These are used by the online safety filter to evaluate the instantaneous
-risk when the car's label transitions away from 'safe'.
+    'safe'          → 0.0       (no penalty)
+    'non_drivable'  → tuneable  (moderate)
+    'pedestrian'    → tuneable  (high)
+    'other_car'     → tuneable  (high)
 """
 
 from __future__ import annotations
@@ -167,7 +138,7 @@ class RoundaboutDFA:
         return self.trans.shape[1]
 
     def label_to_column(self, label: str) -> int:
-        """Map a cell label string to the transition-table column index."""
+        """Map a label string to its transition-table column index. Raises KeyError for unknown labels."""
         if label not in self._label_to_col:
             raise KeyError(f"Unknown DFA label '{label}'. Valid labels: {list(self._label_to_col)}")
         return self._label_to_col[label]

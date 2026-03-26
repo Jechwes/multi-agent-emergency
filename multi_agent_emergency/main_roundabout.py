@@ -1,35 +1,47 @@
 """
 main_roundabout.py
 ==================
-Single-car roundabout scenario using:
+Single-agent roundabout scenario: ego car with pedestrian avoidance.
 
-  1. **Single DFATree-based DP**  (offline, computed once)
-     Risk-minimising decoupled value iteration.  Cost design:
-       - road cells have *negative* cost → reward for driving
-       - lane edges have *positive* cost → risk penalty
-       - higher forward speed gets a lower (more negative) action cost
-     ⟹ The car naturally drives forward and stays centred.
+The system has three offline-built components and one online loop:
 
-  2. **MPC-based safety filter**  (online, predictive risk)
-      Scores MPC horizon risk and switches mode using soft/hard
-      thresholds: nominal, evasive, or emergency brake.
+  1. **DFATree DP — nominal policy**  (offline)
+     Risk-minimising decoupled value iteration over (s, d).  Cost design:
+       - road cells: negative cost → reward forward driving
+       - lane edges: positive quadratic penalty
+       - higher speed: lower action cost (more negative)
+     Maps (s, d) → (v_s, v_d) speed targets.
 
-  3. **MPC tracking controller**  (Cartesian reference from DP policy)
+  2. **DFATree DP — evasive policy**  (offline)
+     Same structure but state is (Δs, d) where Δs is the ego-to-pedestrian
+     gap.  Speed is penalised (+k_speed * v_s) so the policy decelerates
+     to maintain a safe gap instead of advancing.
+
+  3. **MPC tracking controller**  (online, CasADi/IPOPT bicycle model)
+     Tracks the Cartesian reference trajectory built from whichever
+     DP policy is active.  Horizon = 5 steps, dt = 0.1 s.
+
+  4. **Safety filter**  (online, predictive risk)
+     Scores the MPC horizon risk for both candidate references each tick
+     and selects the operation mode:
+       NOMINAL  – nominal policy, no intervention
+       CAUTION  – predicted risk exceeds soft threshold → switch to evasive
+       BRAKE    – predicted risk exceeds hard threshold → emergency stop
 
 Architecture
 ------------
-    ┌───────────────┐     ┌────────────────────┐     ┌───────────────┐
-    │ Roundabout     │────▶│ DFATree DP         │────▶│ MPC Tracker │
-    │ Lanelet Map    │     │ (offline, 1 tree)  │     │ (CARLA)      │
-    └───────────────┘     └────────────────────┘     └───────────────┘
-          ▲                        │                       ▲
-          │  Frenet (s,d)         │ (v_s,v_d) policy       │
-          └────────────────────────┘                       │
-                                                           │
-                              ┌──────────────┐             │
-                              │ Safety Filter │────────────┘
-                              │ (MPC risk)    │  mode selection
-                              └──────────────┘
+    ┌───────────────┐     ┌──────────────────────┐     ┌───────────────┐
+    │ Roundabout    │────▶│ DFATree DP           │────▶│ MPC Tracker  │
+    │ Lanelet Map   │     │ (nominal + evasive)  │     │ (CARLA)      │
+    └───────────────┘     └──────────────────────┘     └───────────────┘
+          ▲                          │                        ▲
+          │  Frenet (s,d) / (Δs,d)  │ (v_s,v_d) policy      │
+          └──────────────────────────┘                       │
+                                                             │
+                                ┌──────────────┐             │
+                                │ Safety Filter│────────────┘
+                                │ (MPC risk)   │  mode + policy selection
+                                └──────────────┘
 """
 
 import argparse
@@ -378,12 +390,11 @@ def main():
             """
             Returns (ped_distance, ped_lane, ped_target_lane).
 
-            ped_distance    : s-direction distance [m]
+            ped_distance    : arc-distance approximation [m], computed as
+                              r_ego * |angular_separation| (not true s-coord)
             ped_lane        : lane index the pedestrian is currently on
-            ped_target_lane : lane the pedestrian is moving toward
-                              (same as ped_lane if stationary / moving
-                              along the lane; None if ped is moving away
-                              from the road)
+            ped_target_lane : lane the pedestrian is moving toward based on
+                              radial velocity; equals ped_lane if stationary
             """
             nonlocal _prev_ped_r
             if env.pedestrian is None:

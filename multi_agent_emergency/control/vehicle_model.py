@@ -1,3 +1,13 @@
+"""
+vehicle_model.py
+================
+CARLA vehicle state wrapper for the ego car.
+
+Reads position, velocity, acceleration, yaw, and steering from the CARLA
+actor each tick via ``update()``.  Also provides a kinematic bicycle model
+``predict(a, delta)`` for one-step state prediction without mutating the
+vehicle state.
+"""
 import math
 import numpy as np
 

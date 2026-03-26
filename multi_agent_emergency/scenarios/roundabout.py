@@ -1,3 +1,16 @@
+"""
+roundabout.py
+=============
+CARLA environment setup for the roundabout scenario.
+
+Handles world initialisation (Town03_Opt, synchronous mode), ego vehicle
+spawning, and pedestrian (walker) management.  The pedestrian patrols
+radially between an inner and outer radius, reversing direction at each
+boundary.
+
+``Environment`` is instantiated once at startup and destroyed in the
+``finally`` block; CARLA world settings are restored on destruction.
+"""
 import carla
 import random
 import math

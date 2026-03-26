@@ -1,21 +1,24 @@
 """
 maker_roundabout_dp.py
 ======================
-Decision maker for the roundabout scenario using the DFATree-based
-dynamic programming algorithm from ``dfa_tree_r1_risk_min.py``.
+Offline DP decision maker for the roundabout scenario using DFATree-based
+risk-minimising value iteration (``dfa_tree_r1_risk_min.py``).
 
-Single-tree architecture
-------------------------
-A **single** DFATree is built offline using a reference lane's
-abstraction.  The decoupled (s, d) policy is reused for every lane
-because all sections share the same Frenet-frame dimensions.
+Two-policy architecture
+-----------------------
+Two DFATrees are built offline at startup:
 
-The tree produces a risk-minimising policy that maps (s, d) to
-(v_s, v_d) speed targets.  Lane changes are **not** part of the DP;
-they are handled by the safety filter.
+  nominal  : state (s, d)    — arc-length and lateral deviation.
+             Action cost = -k_speed * v_s  (reward forward speed).
+             Policy maps (s, d) → (v_s, v_d).
 
-The DFATree structure is retained so that multi-agent / LTL extensions
-can be added later without rearchitecting.
+  evasive  : state (Δs, d)   — ego-to-pedestrian gap and lateral deviation.
+             Action cost = +k_speed * v_s  (penalise speed to maintain gap).
+             Policy maps (Δs, d) → (v_s, v_d).
+
+Both policies are decoupled 1-D single-integrators; the same Frenet
+dimensions are shared across all sections.  Lane changes are not part
+of the DP — they are handled by the safety filter.
 """
 
 from __future__ import annotations
@@ -42,15 +45,21 @@ class RoundaboutDPDecisionMaker:
     """
     Offline DP solver + online policy lookup.
 
-    Builds ONE DFATree from the abstraction data, then provides:
-      - ``get_action(s, d)`` → (v_s, v_d)  policy lookup
-      - ``get_value(s, d)``  → float         value function query
+    Offline DP solver for both the nominal and evasive policies.
+
+    Builds TWO DFATrees offline (one nominal, one evasive), then provides:
+      - ``get_action(s, d, policy_type)`` → (v_s, v_d)  policy lookup
+      - ``get_value(s, d, policy_type)``  → float        value function query
+
+    For the evasive policy, the first argument to get_action/get_value is
+    Δs (ego-to-pedestrian gap), not arc-length s.
 
     Parameters
     ----------
-    dfa       : RoundaboutDFA instance
-    abs_data  : dict returned by ``build_abstraction()``
-    gamma     : discount factor
+    dfa              : RoundaboutDFA instance
+    abs_data_nominal : dict returned by ``build_abstraction()``
+    abs_data_evasive : dict returned by ``build_relative_abstraction()``
+    gamma            : discount factor
     n_tree_iters, n_vi_per_iter, n_grow : DFATree solver parameters
     """
     def __init__(
@@ -177,10 +186,11 @@ class RoundaboutDPDecisionMaker:
         self, s: float, d: float, policy_type: str = 'nominal'
     ) -> Tuple[float, float]:
         """
-        Look up the offline policy at Frenet state (s, d).
+        Look up the offline policy at state (s, d).
 
-        Returns (v_s, v_d) speed targets, decoded using the
-        correct abstraction's action arrays.
+        For policy_type='nominal', s is arc-length within the section.
+        For policy_type='evasive', s is Δs (ego-to-pedestrian gap).
+        Returns (v_s, v_d) speed targets.
         """
         q = self.q_current
         if q == int(self.dfa.sink):
@@ -216,7 +226,10 @@ class RoundaboutDPDecisionMaker:
         self, s: float, d: float, policy_type: str = 'nominal'
     ) -> float:
         """
-        Query the risk value at Frenet state (s, d).
+        Query the risk value at state (s, d).
+
+        For policy_type='nominal', s is arc-length within the section.
+        For policy_type='evasive', s is Δs (ego-to-pedestrian gap).
         """
         q = self.q_current
         if q == int(self.dfa.sink):

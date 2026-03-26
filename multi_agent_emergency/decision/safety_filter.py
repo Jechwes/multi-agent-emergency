@@ -1,31 +1,33 @@
 """
 safety_filter.py
 ================
-Online safety filter that monitors the ego car's environment and
-intervenes when necessary.
+Online safety filter that monitors the ego environment and selects the
+operation mode each tick.
 
-The safety filter is **connected to the co-safety DFA**:
+Connected to the co-safety DFA:
 
     φ = G( ¬non_drivable  ∧  ¬pedestrian  ∧  ¬other_car )
 
-At every time step, the filter calls ``dfa.classify_state()`` to
-determine the current label.  The associated ``dfa.risk_cost`` for that
-label is used for:
-  1. grading the *severity* of the current situation
-  2. ranking lane-change candidates by expected violation cost
-
-The DFA state ``q_current`` is advanced by the decision maker; the
-safety filter only reads it to detect if the spec has already been
-violated (q == sink).
+At every time step the filter evaluates the **predictive horizon risk**:
+it scores the MPC reference trajectory using ``stage_risk_cost()`` over
+the full horizon and sums with a discount factor.  The result drives
+mode selection via ``select_mode()``.
 
 Intervention levels
 -------------------
-    NOMINAL   – label is 'safe', no intervention
-    CAUTION   – predicted risk is elevated, use evasive policy
-    BRAKE     – an obstacle is within brake distance, emergency stop
+    NOMINAL  – predicted risk ≤ soft threshold; nominal DP policy active
+    CAUTION  – predicted risk > soft threshold; switch to evasive policy
+    BRAKE    – predicted risk > hard threshold; emergency full stop
 
-The filter also suggests the safest reachable lane by summing the
-DFA risk costs of each candidate lane's expected label.
+Two checks are kept separate:
+  - ``evaluate()`` / ``check_collision()`` — actual DFA-label violations
+    (collision, off-road).  Used to advance the DFA state and detect
+    real specification failures.
+  - ``stage_risk_cost()`` / ``predicted_horizon_risk()`` — proximity-based
+    predictive risk.  Used for early intervention before a violation occurs.
+
+``suggest_lane()`` returns the safest adjacent drivable lane when the car
+is in CAUTION mode and the threat is far enough to allow a lane change.
 """
 
 from __future__ import annotations

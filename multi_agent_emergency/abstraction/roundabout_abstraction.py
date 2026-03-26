@@ -486,7 +486,15 @@ def _build_relative_transitions(
     speed_values: np.ndarray,
     process_noise: float = 0.08,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Build stochastic P_delta_s. Action v_s reduces obstacle distance."""
+    """
+    Build stochastic transition matrix for relative gap Δs = ego-to-pedestrian distance.
+    Higher ego speed v_s shrinks the gap: Δs' = Δs - v_s * dt.
+
+    Returns
+    -------
+    P_flat  : (N, N*nu) action-conditioned transition matrix.
+    centres : (N,) cell centres over [0, dist_max].
+    """
     nu = len(speed_values)
     cell_w = dist_max / N
     centres = np.linspace(cell_w / 2, dist_max - cell_w / 2, N)
@@ -530,7 +538,15 @@ def build_relative_abstraction(
     process_noise_d: float = 0.08,
     n_letters: int = 4,
 ) -> Dict:
-    """Builds the relative-distance abstraction for the evasive policy."""
+    """
+    Build the evasive policy abstraction in relative coordinates (Δs, d).
+
+    Δs is the ego-to-pedestrian gap; d is the lateral deviation.
+    Unlike the nominal policy, speed is penalised (+k_speed * v_s) so
+    the evasive policy slows down to maintain a safe gap.
+
+    Returns a dict with the same keys as build_abstraction (no ped_data).
+    """
     lane_width = rmap.lane_width
     half_w = lane_width / 2.0
     
