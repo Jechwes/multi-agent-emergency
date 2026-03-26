@@ -7,13 +7,7 @@ import networkx as nx
 import numpy as np
 from scipy.sparse import csr_matrix, issparse
 from scipy import sparse
-
-# Try relative import first (when used as part of decision package),
-# fall back to FMTensJelmar's version via sys.path
-try:
-    from ..abstraction.utils.pc_utils import Pc
-except (ImportError, ValueError):
-    from src.abstraction.utils.pc_utils import Pc
+from abstraction.pc_utils import Pc
 
 
 class DFATree:

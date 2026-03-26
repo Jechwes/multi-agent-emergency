@@ -21,7 +21,7 @@ class MPC_controller:
         self.X_ref = self.opti.parameter(self.x_dim, self.horizon)
         self.X_0 = self.opti.parameter(self.x_dim)
 
-        self.Q = np.diag([5.0, 5.0, 1.0, .0])  # penalty for states
+        self.Q = np.diag([5.0, 5.0, 1.0, 3.0])  # penalty for states
         self.Qf = np.diag([2.0, 2.0, 3.0, .0])  # penalty for end state
         self.R = np.diag([1, 1]) # penalty for inputs
 

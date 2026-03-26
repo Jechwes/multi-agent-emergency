@@ -33,7 +33,6 @@ Architecture
 """
 
 import argparse
-import time
 import math
 from typing import Optional
 
@@ -63,7 +62,7 @@ from control.trackingMPC import MPC_controller
 from abstraction.roundabout_lanelets import RoundaboutLaneletMap
 from abstraction.roundabout_abstraction import build_abstraction, build_relative_abstraction, LaneletGraph
 
-from decision.specification.roundabout_dfa import RoundaboutDFA
+from decision.roundabout_dfa import RoundaboutDFA
 from decision.maker_roundabout_dp import RoundaboutDPDecisionMaker
 from decision.safety_filter import SafetyFilter, RiskLevel, CrashError
 
@@ -105,14 +104,22 @@ def build_mpc_reference(
         # 1. Query policy at CURRENT (s, d)
         v_s, v_d = action_fn(s, d)
 
-        # 2. Integrate BOTH states
+        # 2. Convert to Cartesian BEFORE integrating so that ref[:, k]
+        #    corresponds to time-step k (aligned with MPC state X[:, k]).
+        cart = sl.to_cartesian(s, d)
+        ref[0, k] = cart.x
+        ref[1, k] = cart.y
+        ref[2, k] = max(abs(v_s), 1.0)
+        ref[3, k] = cart.heading
+
+        # 3. Integrate BOTH states (for the NEXT iteration)
         s += v_s * mpc_dt
         d += v_d * mpc_dt
 
-        # 3. Clamp d to lane bounds (matches DP grid: wrap=False)
+        # 4. Clamp d to lane bounds (matches DP grid: wrap=False)
         d = float(np.clip(d, -half_w, half_w))
 
-        # 4. Wrap s across section boundaries
+        # 5. Wrap s across section boundaries
         while s >= sl.arc_length:
             s -= sl.arc_length
             sec = rmap.next_section(sec)
@@ -121,13 +128,6 @@ def build_mpc_reference(
             sec = rmap.prev_section(sec)
             sl = rmap.get_section_lanelet(sec, lane)
             s += sl.arc_length
-
-        # 5. Convert to Cartesian using ACTUAL d
-        cart = sl.to_cartesian(s, d)
-        ref[0, k] = cart.x
-        ref[1, k] = cart.y
-        ref[2, k] = max(abs(v_s), 1.0)
-        ref[3, k] = cart.heading
 
     return ref
 
@@ -183,7 +183,7 @@ def main():
     GAMMA        = 0.5
     K_SPEED      = 0.05
     K_LAT        = 0.01
-    ROAD_REWARD  = -0.01
+    ROAD_REWARD  = -1
     EDGE_PENALTY = 0.5
     DRIVABLE_LANES = (1, 2)
     TRANSITION_NOISE_S = 0.08
@@ -193,6 +193,12 @@ def main():
     N_TREE_ITERS  = 3
     N_GROW        = 2
     N_VI_PER_ITER = 10
+
+    # Lateral centering gain: counteracts MPC heading bias on curves.
+    # The MPC's kinematic bicycle model can't predict CARLA's tire
+    # sideslip, causing a persistent ~0.05 rad heading error on curves.
+    # This P-gain in the reference trajectory pulls d back toward 0.
+    K_CENTER     = 3.0
 
     # Safety filter (predictive risk)
     SF_WARN_DIST      = 20.0       # pedestrian warning distance [m]
@@ -598,7 +604,9 @@ def main():
             v_s_nom, v_d_nom = maker.get_action(s_ego, d_ego, policy_type='nominal')
 
             def _nominal_action(s: float, d: float):
-                return maker.get_action(s, d, policy_type='nominal')
+                v_s, v_d = maker.get_action(s, d, policy_type='nominal')
+                v_d -= K_CENTER * d  # centering correction
+                return v_s, v_d
 
             ref_nominal = build_mpc_reference(
                 action_fn=_nominal_action,
@@ -647,6 +655,7 @@ def main():
                         v_s, v_d = maker.get_action(
                             current_gap, d, policy_type='evasive'
                         )
+                        v_d -= K_CENTER * d  # centering correction
 
                         # Shrink gap for the next horizon step
                         # (matches _build_relative_transitions exactly)

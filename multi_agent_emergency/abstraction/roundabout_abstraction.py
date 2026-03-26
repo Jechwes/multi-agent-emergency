@@ -476,24 +476,6 @@ def build_abstraction(
 
 
 # ---------------------------------------------------------------------------
-# Coordinate helpers
-# ---------------------------------------------------------------------------
-
-def frenet_to_cell_indices(
-    s: float, d: float,
-    centres_s: np.ndarray,
-    centres_d: np.ndarray,
-) -> Tuple[int, int]:
-    """Map continuous Frenet (s, d) to nearest grid cell indices."""
-    cell_w_s = centres_s[1] - centres_s[0] if len(centres_s) > 1 else 1.0
-    cell_w_d = centres_d[1] - centres_d[0] if len(centres_d) > 1 else 1.0
-
-    i_s = int(np.clip(round((s - centres_s[0]) / cell_w_s), 0, len(centres_s) - 1))
-    i_d = int(np.clip(round((d - centres_d[0]) / cell_w_d), 0, len(centres_d) - 1))
-    return i_s, i_d
-
-
-# ---------------------------------------------------------------------------
 # Relative transition matrix builder
 # ---------------------------------------------------------------------------
 
