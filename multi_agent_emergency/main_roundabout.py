@@ -1,39 +1,50 @@
 """
 main_roundabout.py
 ==================
-Single-car roundabout scenario using:
+Single-agent roundabout scenario: ego car with pedestrian avoidance.
 
-  1. **Single DFATree-based DP**  (offline, computed once)
-     Risk-minimising decoupled value iteration.  Cost design:
-       - road cells have *negative* cost → reward for driving
-       - lane edges have *positive* cost → risk penalty
-       - higher forward speed gets a lower (more negative) action cost
-     ⟹ The car naturally drives forward and stays centred.
+The system has three offline-built components and one online loop:
 
-  2. **MPC-based safety filter**  (online, predictive risk)
-      Scores MPC horizon risk and switches mode using soft/hard
-      thresholds: nominal, evasive, or emergency brake.
+  1. **DFATree DP — nominal policy**  (offline)
+     Risk-minimising decoupled value iteration over (s, d).  Cost design:
+       - road cells: negative cost → reward forward driving
+       - lane edges: positive quadratic penalty
+       - higher speed: lower action cost (more negative)
+     Maps (s, d) → (v_s, v_d) speed targets.
 
-  3. **MPC tracking controller**  (Cartesian reference from DP policy)
+  2. **DFATree DP — evasive policy**  (offline)
+     Same structure but state is (Δs, d) where Δs is the ego-to-pedestrian
+     gap.  Speed is penalised (+k_speed * v_s) so the policy decelerates
+     to maintain a safe gap instead of advancing.
+
+  3. **MPC tracking controller**  (online, CasADi/IPOPT bicycle model)
+     Tracks the Cartesian reference trajectory built from whichever
+     DP policy is active.  Horizon = 5 steps, dt = 0.1 s.
+
+  4. **Safety filter**  (online, predictive risk)
+     Scores the MPC horizon risk for both candidate references each tick
+     and selects the operation mode:
+       NOMINAL  – nominal policy, no intervention
+       CAUTION  – predicted risk exceeds soft threshold → switch to evasive
+       BRAKE    – predicted risk exceeds hard threshold → emergency stop
 
 Architecture
 ------------
-    ┌───────────────┐     ┌────────────────────┐     ┌───────────────┐
-    │ Roundabout     │────▶│ DFATree DP         │────▶│ MPC Tracker │
-    │ Lanelet Map    │     │ (offline, 1 tree)  │     │ (CARLA)      │
-    └───────────────┘     └────────────────────┘     └───────────────┘
-          ▲                        │                       ▲
-          │  Frenet (s,d)         │ (v_s,v_d) policy       │
-          └────────────────────────┘                       │
-                                                           │
-                              ┌──────────────┐             │
-                              │ Safety Filter │────────────┘
-                              │ (MPC risk)    │  mode selection
-                              └──────────────┘
+    ┌───────────────┐     ┌──────────────────────┐     ┌───────────────┐
+    │ Roundabout    │────▶│ DFATree DP           │────▶│ MPC Tracker  │
+    │ Lanelet Map   │     │ (nominal + evasive)  │     │ (CARLA)      │
+    └───────────────┘     └──────────────────────┘     └───────────────┘
+          ▲                          │                        ▲
+          │  Frenet (s,d) / (Δs,d)  │ (v_s,v_d) policy      │
+          └──────────────────────────┘                       │
+                                                             │
+                                ┌──────────────┐             │
+                                │ Safety Filter│────────────┘
+                                │ (MPC risk)   │  mode + policy selection
+                                └──────────────┘
 """
 
 import argparse
-import time
 import math
 from typing import Optional
 
@@ -63,7 +74,7 @@ from control.trackingMPC import MPC_controller
 from abstraction.roundabout_lanelets import RoundaboutLaneletMap
 from abstraction.roundabout_abstraction import build_abstraction, build_relative_abstraction, LaneletGraph
 
-from decision.specification.roundabout_dfa import RoundaboutDFA
+from decision.roundabout_dfa import RoundaboutDFA
 from decision.maker_roundabout_dp import RoundaboutDPDecisionMaker
 from decision.safety_filter import SafetyFilter, RiskLevel, CrashError
 
@@ -81,25 +92,46 @@ def build_mpc_reference(
     lane: int,
     mpc_dt: float,
     mpc_horizon: int,
-    d_ref: float = 0.0,
 ) -> np.ndarray:
     """
     Roll out the DP policy at MPC resolution and convert each
     Frenet waypoint to Cartesian.
 
+    Both s and d are integrated forward using the policy's
+    (v_s, v_d) output at each step.
+
     Returns
     -------
     ref : np.ndarray (4, mpc_horizon)   [x, y, v, yaw]
     """
+    half_w = rmap.lane_width / 2.0
     ref = np.zeros((4, mpc_horizon), dtype=float)
+
     s = s0
+    d = d0
     sec = section
     sl = rmap.get_section_lanelet(sec, lane)
 
     for k in range(mpc_horizon):
-        v_s, v_d = action_fn(s, d0)
-        s += v_s * mpc_dt
+        # 1. Query policy at CURRENT (s, d)
+        v_s, v_d = action_fn(s, d)
 
+        # 2. Convert to Cartesian BEFORE integrating so that ref[:, k]
+        #    corresponds to time-step k (aligned with MPC state X[:, k]).
+        cart = sl.to_cartesian(s, d)
+        ref[0, k] = cart.x
+        ref[1, k] = cart.y
+        ref[2, k] = max(abs(v_s), 1.0)
+        ref[3, k] = cart.heading
+
+        # 3. Integrate BOTH states (for the NEXT iteration)
+        s += v_s * mpc_dt
+        d += v_d * mpc_dt
+
+        # 4. Clamp d to lane bounds (matches DP grid: wrap=False)
+        d = float(np.clip(d, -half_w, half_w))
+
+        # 5. Wrap s across section boundaries
         while s >= sl.arc_length:
             s -= sl.arc_length
             sec = rmap.next_section(sec)
@@ -108,12 +140,6 @@ def build_mpc_reference(
             sec = rmap.prev_section(sec)
             sl = rmap.get_section_lanelet(sec, lane)
             s += sl.arc_length
-
-        cart = sl.to_cartesian(s, d_ref)
-        ref[0, k] = cart.x
-        ref[1, k] = cart.y
-        ref[2, k] = max(abs(v_s), 1.0)
-        ref[3, k] = cart.heading
 
     return ref
 
@@ -169,7 +195,7 @@ def main():
     GAMMA        = 0.5
     K_SPEED      = 0.05
     K_LAT        = 0.01
-    ROAD_REWARD  = -0.01
+    ROAD_REWARD  = -1
     EDGE_PENALTY = 0.5
     DRIVABLE_LANES = (1, 2)
     TRANSITION_NOISE_S = 0.08
@@ -179,6 +205,12 @@ def main():
     N_TREE_ITERS  = 3
     N_GROW        = 2
     N_VI_PER_ITER = 10
+
+    # Lateral centering gain: counteracts MPC heading bias on curves.
+    # The MPC's kinematic bicycle model can't predict CARLA's tire
+    # sideslip, causing a persistent ~0.05 rad heading error on curves.
+    # This P-gain in the reference trajectory pulls d back toward 0.
+    K_CENTER     = 3.0
 
     # Safety filter (predictive risk)
     SF_WARN_DIST      = 20.0       # pedestrian warning distance [m]
@@ -271,7 +303,7 @@ def main():
             dt=DT_DP,
             N_s=N_S,
             N_d=N_D,
-            N_p=1, # no ped grid
+            N_p=0, # signal: no pedestrian dimension
             v_s_max=V_S_MAX,
             v_d_max=V_D_MAX,
             n_speed_levels_s=N_SPEED_S,
@@ -358,12 +390,11 @@ def main():
             """
             Returns (ped_distance, ped_lane, ped_target_lane).
 
-            ped_distance    : s-direction distance [m]
+            ped_distance    : arc-distance approximation [m], computed as
+                              r_ego * |angular_separation| (not true s-coord)
             ped_lane        : lane index the pedestrian is currently on
-            ped_target_lane : lane the pedestrian is moving toward
-                              (same as ped_lane if stationary / moving
-                              along the lane; None if ped is moving away
-                              from the road)
+            ped_target_lane : lane the pedestrian is moving toward based on
+                              radial velocity; equals ped_lane if stationary
             """
             nonlocal _prev_ped_r
             if env.pedestrian is None:
@@ -465,6 +496,7 @@ def main():
                     current_lane=lane_k,
                     ped_distance=ped_dist_k,
                     ped_on_lane=ped_lane,
+                    ped_target_lane=_ped_target_lane,
                     collision_radius=COLLISION_RADIUS,
                 )
                 stage_costs.append(c_k)
@@ -517,44 +549,61 @@ def main():
             s_ego = frenet.s
             d_ego = frenet.d
 
-            # Snap to nearest drivable lane if off-road
+            # Snap to nearest drivable lane if off-road, then recompute Frenet
+            # so that s_ego/d_ego are expressed relative to the snapped lane's
+            # centre (not the detected non-drivable lane's centre).
             if lane_id not in DRIVABLE_LANES:
                 lane_id = min(DRIVABLE_LANES,
                               key=lambda l: abs(l - lane_id))
+                sl_snap = rmap.get_section_lanelet(sec_id, lane_id)
+                frenet = sl_snap.to_frenet(ego_xy, speed=ego_v, yaw=ego_yaw)
+                s_ego = frenet.s
+                d_ego = frenet.d
             current_lane = lane_id
 
             # --- Pedestrian info ---
-            ped_dist, ped_lane, ped_target_lane = _get_ped_info(ego_xy)
+            ped_dist, _, _ped_target_lane = _get_ped_info(ego_xy)
 
-            # True Euclidean pedestrian collision check
+            # Euclidean distance: single authoritative collision metric for pedestrian.
+            # Arc-length (ped_dist) is only used for proximity/risk scoring below.
+            ped_euclidean_dist: Optional[float] = None
             if env.pedestrian is not None:
                 ped_loc = env.pedestrian.get_location()
-                dist_xy = math.hypot(ego_xy[0] - ped_loc.x, ego_xy[1] - ped_loc.y)
-                if dist_xy < COLLISION_RADIUS:
-                    raise CrashError("Crashed into pedestrian (label: 'pedestrian')")
+                ped_euclidean_dist = math.hypot(
+                    ego_xy[0] - ped_loc.x, ego_xy[1] - ped_loc.y
+                )
 
-            # --- Collision detection (other hazards) ---
+            # --- Pedestrian collision check (Euclidean, no lane filter) ---
+            if ped_euclidean_dist is not None and ped_euclidean_dist < COLLISION_RADIUS:
+                raise CrashError("Crashed into pedestrian (label: 'pedestrian')")
+
+            # --- Collision detection (off-road and other car hazards) ---
+            # Pedestrian is excluded here; it is already handled above with the
+            # Euclidean metric, which is more reliable than the arc-length estimate.
             crash_msg = safety_filter.check_collision(
                 d_ego, current_lane,
-                ped_distance=ped_dist, ped_on_lane=ped_lane,
+                ped_distance=None, ped_on_lane=None,
                 collision_radius=COLLISION_RADIUS,
             )
             if crash_msg is not None:
                 raise CrashError(crash_msg)
 
-            # --- Safety filter evaluation ---
-            risk_level, sf_info = safety_filter.evaluate(
-                d_ego, current_lane,
-                ped_distance=ped_dist, ped_on_lane=ped_lane,
-                ped_target_lane=ped_target_lane,
-                collision_radius=COLLISION_RADIUS,
-            )
-
             # --- Advance DFA state based on actual AP violation ---
             # dfa_label reflects real violations (collision / off-road),
-            # NOT proximity warnings.  The safety filter prevents
+            # NOT proximity warnings. The safety filter prevents
             # violations; the DFA only transitions on actual failure.
-            dfa_label = sf_info['dfa_label']
+            ped_collision = (
+                ped_euclidean_dist is not None
+                and ped_euclidean_dist < COLLISION_RADIUS
+            )
+            
+            dfa_label = dfa.classify_state(
+                d_ego=d_ego,
+                lane_half_width=LANE_WIDTH / 2.0,
+                lane_drivable=(current_lane in DRIVABLE_LANES),
+                ped_nearby=ped_collision,
+                car_nearby=False, # Single car scenario
+            )
             maker.update_dfa_state(dfa_label)
 
             # If the DFA entered its fail state, the spec is violated
@@ -566,7 +615,9 @@ def main():
             v_s_nom, v_d_nom = maker.get_action(s_ego, d_ego, policy_type='nominal')
 
             def _nominal_action(s: float, d: float):
-                return maker.get_action(s, d, policy_type='nominal')
+                v_s, v_d = maker.get_action(s, d, policy_type='nominal')
+                v_d -= K_CENTER * d  # centering correction
+                return v_s, v_d
 
             ref_nominal = build_mpc_reference(
                 action_fn=_nominal_action,
@@ -575,7 +626,6 @@ def main():
                 section=sec_id, lane=current_lane,
                 mpc_dt=MPC_DT,
                 mpc_horizon=MPC_HORIZON,
-                d_ref=0.0,
             )
 
             risk_nominal, risk_nom_label = _predictive_risk_from_reference(ref_nominal)
@@ -598,9 +648,32 @@ def main():
                         ped_dist, d_ego, policy_type='evasive'
                     )
 
-                    def _evasive_action(_: float, d: float):
-                        return maker.get_action(ped_dist, d, policy_type='evasive')
+                    # Stateful closure: tracks the evolving gap over the horizon
+                    _eva_delta_s = ped_dist  # initial gap
 
+                    def _evasive_action(s: float, d: float):
+                        """
+                        Query evasive policy at the current (delta_s, d).
+                        
+                        s (absolute arc-length from build_mpc_reference) is unused —
+                        the evasive policy operates in relative coordinates.
+                        The gap delta_s is evolved internally to match the
+                        MDP's transition model: delta_s' = delta_s - v_s * dt.
+                        """
+                        nonlocal _eva_delta_s
+                        current_gap = _eva_delta_s
+
+                        v_s, v_d = maker.get_action(
+                            current_gap, d, policy_type='evasive'
+                        )
+                        v_d -= K_CENTER * d  # centering correction
+
+                        # Shrink gap for the next horizon step
+                        # (matches _build_relative_transitions exactly)
+                        _eva_delta_s = max(current_gap - v_s * MPC_DT, 0.0)
+
+                        return v_s, v_d
+                
                     ref_evasive = build_mpc_reference(
                         action_fn=_evasive_action,
                         rmap=rmap,
@@ -608,7 +681,6 @@ def main():
                         section=sec_id, lane=current_lane,
                         mpc_dt=MPC_DT,
                         mpc_horizon=MPC_HORIZON,
-                        d_ref=0.0,
                     )
                     risk_evasive, risk_eva_label = _predictive_risk_from_reference(ref_evasive)
 
@@ -634,9 +706,6 @@ def main():
                     control_cmd = carla.VehicleControl(brake=1.0, throttle=0.0)
                 else:
                     control_cmd = ego_controller.solve_trajectory(ref_traj)
-                if operation_mode == RiskLevel.BRAKE:
-                    control_cmd.throttle = 0.0
-                    control_cmd.brake = 1.0
                 env.ego_car.apply_control(control_cmd)
             except Exception as e:
                 try:
@@ -646,9 +715,6 @@ def main():
                         control_cmd = carla.VehicleControl(brake=1.0, throttle=0.0)
                     else:
                         control_cmd = ego_controller.solve(target_pt, speed)
-                    if operation_mode == RiskLevel.BRAKE:
-                        control_cmd.throttle = 0.0
-                        control_cmd.brake = 1.0
                     env.ego_car.apply_control(control_cmd)
                 except Exception:
                     if operation_mode == RiskLevel.BRAKE:

@@ -38,7 +38,6 @@ Cost design
 
 from __future__ import annotations
 
-import math
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -112,20 +111,6 @@ class LaneletGraph:
                 result.append(adj)
         return result
 
-    # %% REDUNDANT %%
-#     def adjacent_drivable_lanes(self, lane_id: int) -> List[int]:
-#         """Return drivable lanes adjacent to lane_id."""
-#         return [l for l in self.adjacent_lanes(lane_id)
-#                 if l in self.drivable_lanes]
-
-    # %% REDUNDANT %%
-#     def s_in_adjacent_lane(
-#         self, s_current: float, current_lane: int, target_lane: int,
-#     ) -> float:
-#         """Map *s* from current_lane to target_lane (same angular position)."""
-#         r_cur = self.inner_radius + (current_lane + 0.5) * self.lane_width
-#         r_tgt = self.inner_radius + (target_lane + 0.5) * self.lane_width
-#         return s_current * (r_tgt / r_cur)
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +375,7 @@ def build_abstraction(
     dt: float = 0.05,
     N_s: int = 10,
     N_d: int = 8,
-    N_p: int = 8,
+    N_p: int = 0, #default to 0 for no pedestrian dimension
     v_s_max: float = 10.0,
     v_d_max: float = 2.0,
     n_speed_levels_s: int = 5,
@@ -455,15 +440,20 @@ def build_abstraction(
         road_reward=road_reward, boundary_penalty=boundary_penalty,
     )
 
-    # Pedestrian
-    ped_data = build_pedestrian_chain(N_p, lane_width, n_lanes, p_move)
-    L_p = _build_pedestrian_labels(
-        ped_data['centres_p'], lane_width, n_lanes, ref_lane, n_letters,
-    )
-    cost_p = _build_pedestrian_cost(
-        ped_data['centres_p'], lane_width, n_lanes, ref_lane,
-        penalty=ped_on_road_penalty,
-    )
+    # Pedestrian — only include if N_p >= 2
+    ped_data = None
+    L_p = None
+    cost_p = None
+
+    if N_p >= 2:
+        ped_data = build_pedestrian_chain(N_p, lane_width, n_lanes, p_move)
+        L_p = _build_pedestrian_labels(
+            ped_data['centres_p'], lane_width, n_lanes, ref_lane, n_letters,
+        )
+        cost_p = _build_pedestrian_cost(
+            ped_data['centres_p'], lane_width, n_lanes, ref_lane,
+            penalty=ped_on_road_penalty,
+        )
 
     # Lanelet graph (for lane change decisions by safety filter)
     graph = LaneletGraph(
@@ -486,24 +476,6 @@ def build_abstraction(
 
 
 # ---------------------------------------------------------------------------
-# Coordinate helpers
-# ---------------------------------------------------------------------------
-
-def frenet_to_cell_indices(
-    s: float, d: float,
-    centres_s: np.ndarray,
-    centres_d: np.ndarray,
-) -> Tuple[int, int]:
-    """Map continuous Frenet (s, d) to nearest grid cell indices."""
-    cell_w_s = centres_s[1] - centres_s[0] if len(centres_s) > 1 else 1.0
-    cell_w_d = centres_d[1] - centres_d[0] if len(centres_d) > 1 else 1.0
-
-    i_s = int(np.clip(round((s - centres_s[0]) / cell_w_s), 0, len(centres_s) - 1))
-    i_d = int(np.clip(round((d - centres_d[0]) / cell_w_d), 0, len(centres_d) - 1))
-    return i_s, i_d
-
-
-# ---------------------------------------------------------------------------
 # Relative transition matrix builder
 # ---------------------------------------------------------------------------
 
@@ -514,7 +486,15 @@ def _build_relative_transitions(
     speed_values: np.ndarray,
     process_noise: float = 0.08,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Build stochastic P_delta_s. Action v_s reduces obstacle distance."""
+    """
+    Build stochastic transition matrix for relative gap Δs = ego-to-pedestrian distance.
+    Higher ego speed v_s shrinks the gap: Δs' = Δs - v_s * dt.
+
+    Returns
+    -------
+    P_flat  : (N, N*nu) action-conditioned transition matrix.
+    centres : (N,) cell centres over [0, dist_max].
+    """
     nu = len(speed_values)
     cell_w = dist_max / N
     centres = np.linspace(cell_w / 2, dist_max - cell_w / 2, N)
@@ -527,7 +507,7 @@ def _build_relative_transitions(
             next_delta_s = centres[i] - v * dt
             # clip to avoid out of bounds (0 is collision, dist_max is safe)
             next_delta_s = np.clip(next_delta_s, 0.0, dist_max - 1e-6)
-            j = int(np.clip(math.floor(next_delta_s / cell_w), 0, N - 1))
+            j = int(np.clip(round((next_delta_s - cell_w / 2) / cell_w), 0, N - 1))
             _distribute_transition_probability(
                 P_flat=P_flat,
                 i=i,
@@ -558,7 +538,15 @@ def build_relative_abstraction(
     process_noise_d: float = 0.08,
     n_letters: int = 4,
 ) -> Dict:
-    """Builds the relative-distance abstraction for the evasive policy."""
+    """
+    Build the evasive policy abstraction in relative coordinates (Δs, d).
+
+    Δs is the ego-to-pedestrian gap; d is the lateral deviation.
+    Unlike the nominal policy, speed is penalised (+k_speed * v_s) so
+    the evasive policy slows down to maintain a safe gap.
+
+    Returns a dict with the same keys as build_abstraction (no ped_data).
+    """
     lane_width = rmap.lane_width
     half_w = lane_width / 2.0
     
@@ -604,7 +592,7 @@ def build_relative_abstraction(
         if ds < 30.0:
             state_cost_delta_s[i] = collision_penalty * (1.0 - ds/30.0)
     
-    action_cost_delta_s = -k_speed * acc_s.copy()
+    action_cost_delta_s = +k_speed * acc_s.copy()  # positive = penalize speed; higher v_s shrinks the gap to the pedestrian
     
     state_cost_d = np.zeros(N_d, dtype=float)
     for i, d in enumerate(centres_d):

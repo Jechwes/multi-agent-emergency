@@ -9,6 +9,7 @@ from scipy.sparse import csr_matrix, issparse
 from scipy import sparse
 from abstraction.pc_utils import Pc
 
+
 class DFATree:
     """
     DFA tree assuming a 0-based DFA:

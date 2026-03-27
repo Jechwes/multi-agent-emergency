@@ -1,21 +1,24 @@
 """
 maker_roundabout_dp.py
 ======================
-Decision maker for the roundabout scenario using the DFATree-based
-dynamic programming algorithm from ``dfa_tree_r1_risk_min.py``.
+Offline DP decision maker for the roundabout scenario using DFATree-based
+risk-minimising value iteration (``dfa_tree_r1_risk_min.py``).
 
-Single-tree architecture
-------------------------
-A **single** DFATree is built offline using a reference lane's
-abstraction.  The decoupled (s, d) policy is reused for every lane
-because all sections share the same Frenet-frame dimensions.
+Two-policy architecture
+-----------------------
+Two DFATrees are built offline at startup:
 
-The tree produces a risk-minimising policy that maps (s, d) to
-(v_s, v_d) speed targets.  Lane changes are **not** part of the DP;
-they are handled by the safety filter.
+  nominal  : state (s, d)    — arc-length and lateral deviation.
+             Action cost = -k_speed * v_s  (reward forward speed).
+             Policy maps (s, d) → (v_s, v_d).
 
-The DFATree structure is retained so that multi-agent / LTL extensions
-can be added later without rearchitecting.
+  evasive  : state (Δs, d)   — ego-to-pedestrian gap and lateral deviation.
+             Action cost = +k_speed * v_s  (penalise speed to maintain gap).
+             Policy maps (Δs, d) → (v_s, v_d).
+
+Both policies are decoupled 1-D single-integrators; the same Frenet
+dimensions are shared across all sections.  Lane changes are not part
+of the DP — they are handled by the safety filter.
 """
 
 from __future__ import annotations
@@ -42,18 +45,23 @@ class RoundaboutDPDecisionMaker:
     """
     Offline DP solver + online policy lookup.
 
-    Builds ONE DFATree from the abstraction data, then provides:
-      - ``get_action(s, d)`` → (v_s, v_d)  policy lookup
-      - ``get_value(s, d)``  → float         value function query
+    Offline DP solver for both the nominal and evasive policies.
+
+    Builds TWO DFATrees offline (one nominal, one evasive), then provides:
+      - ``get_action(s, d, policy_type)`` → (v_s, v_d)  policy lookup
+      - ``get_value(s, d, policy_type)``  → float        value function query
+
+    For the evasive policy, the first argument to get_action/get_value is
+    Δs (ego-to-pedestrian gap), not arc-length s.
 
     Parameters
     ----------
-    dfa       : RoundaboutDFA instance
-    abs_data  : dict returned by ``build_abstraction()``
-    gamma     : discount factor
+    dfa              : RoundaboutDFA instance
+    abs_data_nominal : dict returned by ``build_abstraction()``
+    abs_data_evasive : dict returned by ``build_relative_abstraction()``
+    gamma            : discount factor
     n_tree_iters, n_vi_per_iter, n_grow : DFATree solver parameters
     """
-
     def __init__(
         self,
         dfa,
@@ -69,20 +77,27 @@ class RoundaboutDPDecisionMaker:
         self.abs_data_evasive = abs_data_evasive
         self.gamma = gamma
 
-        # Unpack abstraction - use evasive/nominal identically since grids match
-        self.acc_s = abs_data_nominal['acc_s']
-        self.acc_d = abs_data_nominal['acc_d']
-        self.centres_s = abs_data_nominal['centres_s']
-        self.centres_d = abs_data_nominal['centres_d']
-        
-        self.centres_evasive_s = abs_data_evasive['centres_s']
-        self.centres_evasive_d = abs_data_evasive['centres_d']
+        # --- Nominal action/grid arrays ---
+        self.acc_s_nominal = abs_data_nominal['acc_s']
+        self.acc_d_nominal = abs_data_nominal['acc_d']
+        self.centres_s_nominal = abs_data_nominal['centres_s']
+        self.centres_d_nominal = abs_data_nominal['centres_d']
+
+        # --- Evasive action/grid arrays ---
+        self.acc_s_evasive = abs_data_evasive['acc_s']
+        self.acc_d_evasive = abs_data_evasive['acc_d']
+        self.centres_s_evasive = abs_data_evasive['centres_s']
+        self.centres_d_evasive = abs_data_evasive['centres_d']
 
         # Build two DFATrees (offline)
         print("[DP] Building nominal tree...")
-        self.tree_nominal = self._build_tree(self.abs_data_nominal, n_tree_iters, n_vi_per_iter, n_grow)
+        self.tree_nominal = self._build_tree(
+            self.abs_data_nominal, n_tree_iters, n_vi_per_iter, n_grow
+        )
         print("[DP] Building evasive tree...")
-        self.tree_evasive = self._build_tree(self.abs_data_evasive, n_tree_iters, n_vi_per_iter, n_grow)
+        self.tree_evasive = self._build_tree(
+            self.abs_data_evasive, n_tree_iters, n_vi_per_iter, n_grow
+        )
 
         # Current DFA state (for online tracking)
         self.q_current: int = dfa.S0
@@ -113,16 +128,17 @@ class RoundaboutDPDecisionMaker:
             np.ones(N_d, dtype=float) / N_d,
         ]
 
-        # Add pedestrian dimension if available
+        # Only add pedestrian dimension if it was actually built
         ped = d.get('ped_data')
-        if ped is not None and 'P_p' in ped:
+        if ped is not None and 'P_p' in ped and d.get('L_p') is not None:
             N_p = len(ped['centres_p'])
-            sysAbs.append(SysAbs1D(ped['P_p']))
-            nx_list.append(N_p)
-            L.append(d['L_p'])
-            cost_map.append(d['cost_p'])
-            action_cost_list.append(None)   # uncontrolled
-            rho.append(ped['rho_p'])
+            if N_p >= 2:                          # ← extra safety check
+                sysAbs.append(SysAbs1D(ped['P_p']))
+                nx_list.append(N_p)
+                L.append(d['L_p'])
+                cost_map.append(d['cost_p'])
+                action_cost_list.append(None)     # uncontrolled
+                rho.append(ped['rho_p'])
 
         n_dims = len(sysAbs)
         n_dfa_states = self.dfa.n_states
@@ -166,10 +182,14 @@ class RoundaboutDPDecisionMaker:
     # Online: policy lookup  (no online solving)
     # ------------------------------------------------------------------
 
-    def get_action(self, s: float, d: float, policy_type: str = 'nominal') -> Tuple[float, float]:
+    def get_action(
+        self, s: float, d: float, policy_type: str = 'nominal'
+    ) -> Tuple[float, float]:
         """
-        Look up the offline policy at Frenet state (s, d).
+        Look up the offline policy at state (s, d).
 
+        For policy_type='nominal', s is arc-length within the section.
+        For policy_type='evasive', s is Δs (ego-to-pedestrian gap).
         Returns (v_s, v_d) speed targets.
         """
         q = self.q_current
@@ -178,12 +198,16 @@ class RoundaboutDPDecisionMaker:
 
         if policy_type == 'evasive':
             tree = self.tree_evasive
-            i_s = self._to_index(s, self.centres_evasive_s)
-            i_d = self._to_index(d, self.centres_evasive_d)
+            i_s = self._to_index(s, self.centres_s_evasive)
+            i_d = self._to_index(d, self.centres_d_evasive)
+            acc_s = self.acc_s_evasive
+            acc_d = self.acc_d_evasive
         else:
             tree = self.tree_nominal
-            i_s = self._to_index(s, self.centres_s)
-            i_d = self._to_index(d, self.centres_d)
+            i_s = self._to_index(s, self.centres_s_nominal)
+            i_d = self._to_index(d, self.centres_d_nominal)
+            acc_s = self.acc_s_nominal
+            acc_d = self.acc_d_nominal
 
         pol_s = tree.pol[q][0]
         pol_d = tree.pol[q][1]
@@ -196,16 +220,16 @@ class RoundaboutDPDecisionMaker:
         a_s = int(np.argmax(pol_s[i_s, :]))
         a_d = int(np.argmax(pol_d[i_d, :]))
 
-        return float(self.acc_s[a_s]), float(self.acc_d[a_d])
+        return float(acc_s[a_s]), float(acc_d[a_d])
 
-    def get_value(self, s: float, d: float, policy_type: str = 'nominal') -> float:
+    def get_value(
+        self, s: float, d: float, policy_type: str = 'nominal'
+    ) -> float:
         """
-        Query the risk value at Frenet state (s, d).
+        Query the risk value at state (s, d).
 
-            V_q(s, d) = sum_{n in L_Q^{-1}(q), n != root}  V_s[n, s] * V_d[n, d]
-
-        The root is excluded because V[root, :] = 0 by initialisation and
-        contributes nothing.  Lower value = safer.  Returns inf at sink.
+        For policy_type='nominal', s is arc-length within the section.
+        For policy_type='evasive', s is Δs (ego-to-pedestrian gap).
         """
         q = self.q_current
         if q == int(self.dfa.sink):
@@ -213,17 +237,15 @@ class RoundaboutDPDecisionMaker:
 
         if policy_type == 'evasive':
             tree = self.tree_evasive
-            i_s = self._to_index(s, self.centres_evasive_s)
-            i_d = self._to_index(d, self.centres_evasive_d)
+            i_s = self._to_index(s, self.centres_s_evasive)
+            i_d = self._to_index(d, self.centres_d_evasive)
         else:
             tree = self.tree_nominal
-            i_s = self._to_index(s, self.centres_s)
-            i_d = self._to_index(d, self.centres_d)
+            i_s = self._to_index(s, self.centres_s_nominal)
+            i_d = self._to_index(d, self.centres_d_nominal)
 
         total = 0.0
         for n in tree.Q.get(q, []):
-            if n == 0:          # root: V = 0, skip for clarity
-                continue
             total += float(tree.V[0][n, i_s]) * float(tree.V[1][n, i_d])
         return total
 

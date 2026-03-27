@@ -1,3 +1,19 @@
+"""
+trackingMPC.py
+==============
+MPC tracking controller for the CARLA ego vehicle.
+
+Uses a kinematic bicycle model (state: x, y, v, yaw; inputs: acceleration,
+steering angle) solved with CasADi/IPOPT over a fixed horizon of 5 steps
+at dt = 0.1 s.
+
+Two solve modes are provided:
+  - ``solve(target, des_speed)``      : tracks a single (x, y, yaw) target
+  - ``solve_trajectory(ref_traj_4xH)``: tracks a pre-built (4, H) reference
+
+The output is a ``carla.VehicleControl`` command applied directly to the
+ego actor each simulation tick.
+"""
 import math
 import casadi as ca
 import carla
@@ -21,7 +37,7 @@ class MPC_controller:
         self.X_ref = self.opti.parameter(self.x_dim, self.horizon)
         self.X_0 = self.opti.parameter(self.x_dim)
 
-        self.Q = np.diag([5.0, 5.0, 1.0, .0])  # penalty for states
+        self.Q = np.diag([5.0, 5.0, 1.0, 3.0])  # penalty for states
         self.Qf = np.diag([2.0, 2.0, 3.0, .0])  # penalty for end state
         self.R = np.diag([1, 1]) # penalty for inputs
 
@@ -84,7 +100,6 @@ class MPC_controller:
         self.opti.solver('ipopt', opts)
 
     def solve(self, target, des_speed):
-        self.car.update()
         X_0 = np.array([self.car.x, self.car.y, self.car.v, self.car.yaw])
         self.opti.set_value(self.X_0, X_0)
         ref_traj = self.gen_ref_traj(target, des_speed)
@@ -95,12 +110,12 @@ class MPC_controller:
         opt_inputs = sol.value(self.U)
         # TO ENABLE SOLVER OUTPUT: uncomment the line below
         # print("opt_inputs", opt_inputs[:, 1])
-        return self.gen_cmd(opt_inputs[0, 1], opt_inputs[1, 1])
+        return self.gen_cmd(opt_inputs[0, 0], opt_inputs[1, 0])
 
     def gen_cmd(self, acc_cmd, delta_cmd):
         cmd = carla.VehicleControl()
         cmd.steer = max(min(delta_cmd/self.delta_bound[1], 1), -1)
-        index = bisect.bisect(list(self.Acc_Table.keys()), abs(acc_cmd)/self.acc_bound[1])-1
+        index = max(0, bisect.bisect(list(self.Acc_Table.keys()), abs(acc_cmd)/self.acc_bound[1]) - 1)
 
         if acc_cmd < 0:
             cmd.throttle = 0
@@ -135,7 +150,6 @@ class MPC_controller:
         -------
         carla.VehicleControl
         """
-        self.car.update()
         X_0 = np.array([self.car.x, self.car.y, self.car.v, self.car.yaw])
         self.opti.set_value(self.X_0, X_0)
         self.opti.set_value(self.X_ref, ref_traj_4xH)
