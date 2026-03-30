@@ -49,10 +49,13 @@ from abstraction.roundabout_abstraction import (
     build_state_cost,
     build_action_cost,
     build_pedestrian_chain,
+    _build_pedestrian_labels,
+    _build_pedestrian_cost,
 )
 
 from decision.roundabout_dfa import RoundaboutDFA
 from decision.maker_roundabout_dp import RoundaboutDPDecisionMaker
+from decision.safety_filter import SafetyFilter, RiskLevel
 from abstraction.roundabout_abstraction import LaneletGraph as _LG
 
 
@@ -78,7 +81,7 @@ def build_mpc_reference_lanelet(
     mpc_dt: float,
     mpc_horizon: int,
     lane_width: float,
-    v_cruise: float = 8.0,
+    v_cruise: float = 10.0,
     lam: float = 2.5,
     K_lc: int = 15,
     a_brake: float = 3.0,
@@ -153,7 +156,7 @@ def build_mpc_reference_lanelet(
             v = max(v - a_brake * mpc_dt, 0.0)
         else:
             # ramp toward cruise speed
-            v = v + min(v_cruise - v, 2.0 * mpc_dt)
+            v = v + min(v_cruise - v, 5.0 * mpc_dt)
             v = max(v, 0.5)
 
         s += v * mpc_dt
@@ -201,7 +204,7 @@ def main():
     INNER_RADIUS = 13.5
     LANE_WIDTH   = 4.0
     N_LANES      = 4
-    N_SECTIONS   = 12
+    N_SECTIONS   = 24
     DIRECTION    = "cw"
     DRIVABLE_LANES = (1, 2)
 
@@ -236,6 +239,13 @@ def main():
 
     # Collision detection
     COLLISION_RADIUS = 1.0
+
+    # Safety filter (accumulated discounted risk thresholds)
+    SF_GAMMA          = 0.7     # discount factor for horizon risk sum
+    SF_SOFT_THRESH    = 150.0    # accumulated risk → CAUTION
+    SF_HARD_THRESH    = 300.0   # accumulated risk → BRAKE
+    SF_CAUTION_SPEED  = 0.4     # cruise speed fraction in CAUTION
+    SF_HORIZON        = 5       # how many sections ahead to look
 
     try:
         # =================================================================
@@ -293,7 +303,7 @@ def main():
             env.world.tick()
 
         # Pedestrian on outer edge
-        PED_SECTION = (start_section_ego + 3) % N_SECTIONS
+        PED_SECTION = (start_section_ego + 11) % N_SECTIONS
         r_ped_spawn = INNER_RADIUS + N_LANES * LANE_WIDTH
         ped_angle = -(PED_SECTION + 0.5) * (2 * math.pi / N_SECTIONS)
         ped_x = CENTRE[0] + r_ped_spawn * math.cos(ped_angle)
@@ -348,6 +358,11 @@ def main():
         cost_p = None
         if N_P >= 2:
             ped_data = build_pedestrian_chain(N_P, LANE_WIDTH, N_LANES, P_MOVE)
+            L_p = _build_pedestrian_labels(
+                ped_data['centres_p'], LANE_WIDTH, N_LANES, EGO_LANE)
+            cost_p = _build_pedestrian_cost(
+                ped_data['centres_p'], LANE_WIDTH, N_LANES, EGO_LANE,
+                penalty=DFA_COST_PED)
 
         # Assemble abstraction dict
         abs_data = {
@@ -385,6 +400,17 @@ def main():
             n_tree_iters=N_TREE_ITERS,
             n_vi_per_iter=N_VI_PER_ITER,
             n_grow=N_GROW,
+        )
+
+        # =================================================================
+        #  4b. SAFETY FILTER (online risk override)
+        # =================================================================
+        safety_filter = SafetyFilter(
+            dfa=dfa,
+            graph=graph,
+            n_lanes=N_LANES,
+            drivable_lanes=set(DRIVABLE_LANES),
+            caution_speed_factor=SF_CAUTION_SPEED,
         )
 
         # =================================================================
@@ -473,6 +499,8 @@ def main():
 
             # Pedestrian lanelet (if visible)
             ped_lanelet_idx = None
+            ped_section = None
+            ped_lane_id = None
             if env.pedestrian is not None:
                 ped_loc = env.pedestrian.get_location()
                 ped_dx = ped_loc.x - CENTRE[0]
@@ -502,6 +530,32 @@ def main():
                 opp_lanelet=opp_idx,
             )
 
+            # -- 4b. Safety filter: accumulated horizon risk --
+            # Look ahead SF_HORIZON sections and score each cell
+            stage_costs = []
+            for k in range(SF_HORIZON):
+                future_sec = (sec_ego + k) % N_SECTIONS
+                cost_k, _ = safety_filter.stage_risk_cost(
+                    ego_section=future_sec,
+                    ego_lane=ego_lane,
+                    n_sections=N_SECTIONS,
+                    ped_section=ped_section if ped_lanelet_idx is not None else None,
+                    ped_lane=ped_lane_id if ped_lanelet_idx is not None else None,
+                    opp_section=sec_opp,
+                    opp_lane=opp_lane if opp_model is not None else None,
+                )
+                stage_costs.append(cost_k)
+
+            pred_risk = SafetyFilter.predicted_horizon_risk(stage_costs, SF_GAMMA)
+            risk_mode = SafetyFilter.select_mode(pred_risk, SF_SOFT_THRESH, SF_HARD_THRESH)
+
+            # Override DP action based on risk mode
+            v_cruise_ego = 10.0
+            if risk_mode == RiskLevel.BRAKE:
+                action_ego = _ACT_YIELD
+            elif risk_mode == RiskLevel.CAUTION:
+                v_cruise_ego = 10 * SF_CAUTION_SPEED
+
             # -- 5. Build MPC references --
             ref_ego, _, _ = build_mpc_reference_lanelet(
                 action=action_ego,
@@ -510,6 +564,7 @@ def main():
                 section=sec_ego, lane=ego_lane,
                 mpc_dt=MPC_DT, mpc_horizon=MPC_HORIZON,
                 lane_width=LANE_WIDTH,
+                v_cruise=v_cruise_ego,
             )
 
             ref_opp = None
@@ -548,8 +603,10 @@ def main():
                 if action_opp is not None:
                     msg += (f"  opp=({sec_opp},{opp_lane}) "
                             f"act={_ACTION_NAMES[action_opp]}")
-                msg += f"  dfa={dfa_label}"
+                msg += f"  dfa={dfa_label}  v={ego_v:.1f}m/s  risk={pred_risk:.0f} mode={risk_mode.name}"
+                msg2 = f"[risk] acc_risk={pred_risk:.1f}"
                 print(msg)
+                print(msg2)
 
     finally:
         if env is not None:

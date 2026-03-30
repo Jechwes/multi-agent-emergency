@@ -1,33 +1,26 @@
 """
 safety_filter.py
 ================
-Online safety filter that monitors the ego environment and selects the
-operation mode each tick.
+Online safety filter for the roundabout scenario.
 
-Connected to the co-safety DFA:
+At every tick the filter evaluates the **predictive horizon risk** by
+scoring each future cell along the MPC look-ahead with ``stage_risk_cost()``
+and summing with a discount factor gamma:
 
-    φ = G( ¬non_drivable  ∧  ¬pedestrian  ∧  ¬other_car )
+    R = Σ_k  γ^k · cost(cell_k)
 
-At every time step the filter evaluates the **predictive horizon risk**:
-it scores the MPC reference trajectory using ``stage_risk_cost()`` over
-the full horizon and sums with a discount factor.  The result drives
-mode selection via ``select_mode()``.
+The accumulated risk R is compared against two thresholds to select a
+mode:
 
-Intervention levels
--------------------
-    NOMINAL  – predicted risk ≤ soft threshold; nominal DP policy active
-    CAUTION  – predicted risk > soft threshold; switch to evasive policy
-    BRAKE    – predicted risk > hard threshold; emergency full stop
+    NOMINAL  – R ≤ soft_threshold   → use nominal DP action
+    CAUTION  – soft < R ≤ hard      → slow down (reduce cruise speed)
+    BRAKE    – R > hard_threshold   → emergency yield (full stop)
 
-Two checks are kept separate:
-  - ``evaluate()`` / ``check_collision()`` — actual DFA-label violations
-    (collision, off-road).  Used to advance the DFA state and detect
-    real specification failures.
-  - ``stage_risk_cost()`` / ``predicted_horizon_risk()`` — proximity-based
-    predictive risk.  Used for early intervention before a violation occurs.
+A higher threshold tolerates more risk and lets the car brake closer
+to the obstacle.  A lower threshold makes it react sooner.
 
 ``suggest_lane()`` returns the safest adjacent drivable lane when the car
-is in CAUTION mode and the threat is far enough to allow a lane change.
+is in CAUTION mode.
 """
 
 from __future__ import annotations
@@ -45,151 +38,103 @@ class RiskLevel(Enum):
     BRAKE    = auto()   # high risk, emergency stop
 
 
-# ── Collision error ──────────────────────────────────────────────────
-class CrashError(Exception):
-    """Raised when a collision is detected.  Contains a message
-    describing what the ego car crashed into."""
-    pass
-
-
 # ── SafetyFilter ─────────────────────────────────────────────────────
 class SafetyFilter:
     """
-    Online safety filter connected to the co-safety DFA.
+    Online safety filter using accumulated discounted risk.
 
     Parameters
     ----------
-    dfa              : RoundaboutDFA (provides classify_state + risk_cost)
-    graph            : LaneletGraph (lane connectivity)
-    lane_width       : lane width [m]
+    dfa              : RoundaboutDFA (provides get_risk_cost per label)
+    graph            : LaneletGraph  (lane connectivity)
     n_lanes          : total number of lanes
     drivable_lanes   : set of normally-drivable lane indices
-    warn_distance    : distance to obstacle triggering CAUTION [m]
-    brake_distance   : distance to obstacle triggering BRAKE [m]
-    caution_speed_factor : MPC speed multiplied by this during CAUTION
+    caution_speed_factor : cruise speed is multiplied by this in CAUTION
     """
 
     def __init__(
         self,
         dfa,
         graph,
-        lane_width: float,
         n_lanes: int,
         drivable_lanes: set,
-        warn_distance: float = 12.0,
-        brake_distance: float = 3.0,
-        lane_change_distance: float = 8.0,
         caution_speed_factor: float = 0.4,
     ) -> None:
         self.dfa = dfa
         self.graph = graph
-        self.lane_width = lane_width
         self.n_lanes = n_lanes
         self.drivable_lanes = set(drivable_lanes)
-        self.warn_distance = warn_distance
-        self.brake_distance = brake_distance
-        self.lane_change_distance = lane_change_distance
         self.caution_speed_factor = caution_speed_factor
 
     # ------------------------------------------------------------------
-    # MPC-predictive risk scoring
+    # Per-cell risk cost
     # ------------------------------------------------------------------
 
     def stage_risk_cost(
         self,
-        d_ego: float,
-        current_lane: int,
-        ped_distance: Optional[float] = None,
-        ped_on_lane: Optional[int] = None,
-        ped_target_lane: Optional[int] = None,
-        car_distance: Optional[float] = None,
-        car_on_lane: Optional[int] = None,
-        collision_radius: float = 1.5,
+        ego_section: int,
+        ego_lane: int,
+        n_sections: int,
+        ped_section: Optional[int] = None,
+        ped_lane: Optional[int] = None,
+        opp_section: Optional[int] = None,
+        opp_lane: Optional[int] = None,
     ) -> Tuple[float, str]:
         """
-        Compute a per-step risk cost for MPC horizon evaluation.
+        Risk cost for a single cell based on what occupies it.
 
-        The returned cost uses DFA risk costs for hard violations and a
-        distance-weighted fraction of the same costs for near-miss cases.
+        Returns the DFA risk cost for the worst hazard present in the
+        cell, or 0 if the cell is clear.  No distance cutoffs — the
+        caller accumulates costs over the horizon with gamma discount,
+        and the thresholds determine the reaction.
         """
-        half_w = self.lane_width / 2.0
+        # Non-drivable lane
+        if ego_lane not in self.drivable_lanes:
+            return float(self.dfa.get_risk_cost('non_drivable')), 'non_drivable'
 
-        ped_collision = (
-            ped_on_lane is not None
-            and ped_distance is not None
-            and ped_on_lane == current_lane
-            and ped_distance < collision_radius
-        )
-        car_collision = (
-            car_on_lane is not None
-            and car_distance is not None
-            and car_on_lane == current_lane
-            and car_distance < collision_radius
-        )
-
-        dfa_label = self.dfa.classify_state(
-            d_ego=d_ego,
-            lane_half_width=half_w,
-            lane_drivable=(current_lane in self.drivable_lanes),
-            ped_nearby=ped_collision,
-            car_nearby=car_collision,
-        )
-
-        if dfa_label != 'safe':
-            return float(self.dfa.get_risk_cost(dfa_label)), dfa_label
-
-        # Score proximity cost for any pedestrian on a drivable lane OR
-        # moving toward one, not just same-lane pedestrians.
-        ped_is_threat = False
-        if ped_on_lane is not None:
-            if ped_on_lane in self.drivable_lanes:
-                ped_is_threat = True
-            elif ped_target_lane is not None:
-                min_drivable = min(self.drivable_lanes) if self.drivable_lanes else current_lane
-                max_drivable = max(self.drivable_lanes) if self.drivable_lanes else current_lane
-                if ped_on_lane > max_drivable and ped_target_lane < ped_on_lane:
-                    ped_is_threat = True
-                elif ped_on_lane < min_drivable and ped_target_lane > ped_on_lane:
-                    ped_is_threat = True
-
-        ped_prox_cost = 0.0
+        # Pedestrian occupies same section
         if (
-            ped_is_threat
-            and ped_distance is not None
-            and ped_distance < self.warn_distance
+            ped_section is not None
+            and ped_lane is not None
+            and ped_lane in self.drivable_lanes
+            and ped_section == ego_section
         ):
-            span = max(self.warn_distance - self.brake_distance, 1e-6)
-            alpha = (self.warn_distance - ped_distance) / span
-            alpha = float(np.clip(alpha, 0.0, 1.0))
-            ped_prox_cost = alpha * float(self.dfa.get_risk_cost('pedestrian'))
+            return float(self.dfa.get_risk_cost('pedestrian')), 'pedestrian'
 
-        car_prox_cost = 0.0
+        # Opponent occupies same section and lane
         if (
-            car_on_lane is not None
-            and car_on_lane == current_lane
-            and car_distance is not None
-            and car_distance < self.warn_distance
+            opp_section is not None
+            and opp_lane is not None
+            and opp_section == ego_section
+            and opp_lane == ego_lane
         ):
-            span = max(self.warn_distance - self.brake_distance, 1e-6)
-            alpha = (self.warn_distance - car_distance) / span
-            alpha = float(np.clip(alpha, 0.0, 1.0))
-            car_prox_cost = alpha * float(self.dfa.get_risk_cost('other_car'))
+            return float(self.dfa.get_risk_cost('collision')), 'collision'
 
-        if ped_prox_cost >= car_prox_cost and ped_prox_cost > 0.0:
-            return ped_prox_cost, 'pedestrian'
-        if car_prox_cost > 0.0:
-            return car_prox_cost, 'other_car'
-        return 0.0, 'safe'
+        return 0.0, 'drivable'
+
+    # ------------------------------------------------------------------
+    # Accumulated horizon risk
+    # ------------------------------------------------------------------
 
     @staticmethod
     def predicted_horizon_risk(stage_costs, gamma: float) -> float:
-        """Discounted predictive risk over an MPC horizon."""
+        """
+        Discounted sum of per-cell risk costs over the look-ahead horizon.
+
+            R = Σ_k  γ^k · cost_k
+
+        A larger gamma weighs distant cells more heavily (longer foresight).
+        """
         total = 0.0
         discount = 1.0
         for c in stage_costs:
             total += discount * float(c)
-            discount *= float(gamma)
-        return float(total)
+            discount *= gamma
+        return total
+
+    # ------------------------------------------------------------------
+    # Mode selection (purely threshold-based)
+    # ------------------------------------------------------------------
 
     @staticmethod
     def select_mode(
@@ -198,11 +143,10 @@ class SafetyFilter:
         hard_threshold: float,
     ) -> RiskLevel:
         """
-        Convert predicted risk to operation mode.
+        Convert accumulated risk to operation mode.
 
-        NOMINAL: predicted_risk <= soft_threshold
-        CAUTION: soft_threshold < predicted_risk <= hard_threshold
-        BRAKE:   predicted_risk > hard_threshold
+        Higher thresholds → car tolerates more risk → brakes closer.
+        Lower thresholds  → car reacts earlier    → brakes farther away.
         """
         if predicted_risk <= soft_threshold:
             return RiskLevel.NOMINAL
@@ -211,43 +155,26 @@ class SafetyFilter:
         return RiskLevel.BRAKE
 
     # ------------------------------------------------------------------
-    # Collision detection (uses DFA classification)
+    # Lane-change suggestion
     # ------------------------------------------------------------------
 
-    def check_collision(
+    def suggest_lane(
         self,
-        d_ego: float,
-        current_lane: int,
-        ped_distance: Optional[float] = None,
-        ped_on_lane: Optional[int] = None,
-        car_distance: Optional[float] = None,
-        car_on_lane: Optional[int] = None,
-        collision_radius: float = 1.5,
-    ) -> Optional[str]:
+        ego_lane: int,
+        ped_lane: Optional[int],
+    ) -> Optional[int]:
         """
-        Check if a collision has occurred.
+        Return a safer adjacent drivable lane, or None.
 
-        Returns None if no collision, otherwise a string matching the
-        DFA letter that was violated.
+        Picks the drivable lane that moves away from the pedestrian's lane.
         """
-        half_w = self.lane_width / 2.0
-
-        # Pedestrian collision — same lane only
-        if (ped_distance is not None
-            and ped_on_lane is not None
-            and ped_on_lane == current_lane
-            and ped_distance < collision_radius):
-            return "Crashed into pedestrian (label: 'pedestrian')"
-
-        # Other car collision — same lane only
-        if (car_distance is not None
-            and car_on_lane is not None
-            and car_on_lane == current_lane
-            and car_distance < collision_radius):
-            return "Crashed into other car (label: 'other_car')"
-
-        # Off-road
-        if abs(d_ego) > half_w and current_lane not in self.drivable_lanes:
-            return "Crashed into non-drivable area (label: 'non_drivable')"
-
-        return None
+        candidates = []
+        for dl in (-1, +1):
+            adj = ego_lane + dl
+            if 0 <= adj < self.n_lanes and adj in self.drivable_lanes:
+                candidates.append(adj)
+        if not candidates:
+            return None
+        if ped_lane is not None:
+            candidates.sort(key=lambda l: abs(l - ped_lane), reverse=True)
+        return candidates[0]

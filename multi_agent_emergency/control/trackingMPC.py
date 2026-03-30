@@ -37,7 +37,7 @@ class MPC_controller:
         self.X_ref = self.opti.parameter(self.x_dim, self.horizon)
         self.X_0 = self.opti.parameter(self.x_dim)
 
-        self.Q = np.diag([5.0, 5.0, 1.0, 3.0])  # penalty for states
+        self.Q = np.diag([5.0, 5.0, 4.0, 3.0])  # penalty for states
         self.Qf = np.diag([2.0, 2.0, 3.0, .0])  # penalty for end state
         self.R = np.diag([1, 1]) # penalty for inputs
 
@@ -117,15 +117,28 @@ class MPC_controller:
     def gen_cmd(self, acc_cmd, delta_cmd):
         cmd = carla.VehicleControl()
         cmd.steer = float(max(min(delta_cmd / self.delta_bound[1], 1.0), -1.0))
-        
+
         acc_norm = abs(acc_cmd) / self.acc_bound[1] if self.acc_bound[1] > 0 else 0.0
-        index = max(0, bisect.bisect(self.acc_keys, acc_norm) - 1)
+        acc_norm = min(acc_norm, 1.0)
 
         if acc_cmd < 0:
             cmd.throttle = 0.0
             cmd.brake = float(min(1.0, acc_norm))
         else:
-            cmd.throttle = float(self.acc_vals[index])
+            # Linear interpolation through the throttle table
+            # to avoid dead-zone at low accelerations
+            idx = max(0, bisect.bisect(self.acc_keys, acc_norm) - 1)
+            idx_next = min(idx + 1, len(self.acc_keys) - 1)
+            k_lo = self.acc_keys[idx]
+            k_hi = self.acc_keys[idx_next]
+            v_lo = self.acc_vals[idx]
+            v_hi = self.acc_vals[idx_next]
+            if k_hi > k_lo:
+                t = (acc_norm - k_lo) / (k_hi - k_lo)
+                throttle = v_lo + t * (v_hi - v_lo)
+            else:
+                throttle = v_lo
+            cmd.throttle = float(max(throttle, 0.0))
             cmd.brake = 0.0
         return cmd
 

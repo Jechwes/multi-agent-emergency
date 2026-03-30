@@ -17,6 +17,7 @@ class Vehicle:
         self.target_vel = 10
         self.dt = dt
         self.speed_max = 40
+        self.steer_max = np.deg2rad(35)
         self.acc_max = 8
         self.steer_change_max = np.deg2rad(15.0)  # maximum steering speed [rad/s]
         wb_vec = vehicle.get_physics_control().wheels[0].position - vehicle.get_physics_control().wheels[2].position
