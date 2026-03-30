@@ -46,6 +46,8 @@ class MPC_controller:
         self.delta_bound = np.array([-1, 1]) * car_model.steer_max
 
         self.Acc_Table = {0: 0, 0.2: 0.5, 0.4: 0.8, 0.6: 0.9, 0.8: 0.95, 1: 1}
+        self.acc_keys = sorted(self.Acc_Table.keys())
+        self.acc_vals = [self.Acc_Table[k] for k in self.acc_keys]
         self.prob_init()
 
     def prob_init(self):
@@ -114,15 +116,17 @@ class MPC_controller:
 
     def gen_cmd(self, acc_cmd, delta_cmd):
         cmd = carla.VehicleControl()
-        cmd.steer = max(min(delta_cmd/self.delta_bound[1], 1), -1)
-        index = max(0, bisect.bisect(list(self.Acc_Table.keys()), abs(acc_cmd)/self.acc_bound[1]) - 1)
+        cmd.steer = float(max(min(delta_cmd / self.delta_bound[1], 1.0), -1.0))
+        
+        acc_norm = abs(acc_cmd) / self.acc_bound[1] if self.acc_bound[1] > 0 else 0.0
+        index = max(0, bisect.bisect(self.acc_keys, acc_norm) - 1)
 
         if acc_cmd < 0:
-            cmd.throttle = 0
-            cmd.brake = abs(acc_cmd)/self.acc_bound[1]
+            cmd.throttle = 0.0
+            cmd.brake = float(min(1.0, acc_norm))
         else:
-            cmd.throttle = list(self.Acc_Table.values())[index]
-            cmd.brake = 0
+            cmd.throttle = float(self.acc_vals[index])
+            cmd.brake = 0.0
         return cmd
 
     def gen_ref_traj(self, target, des_speed):

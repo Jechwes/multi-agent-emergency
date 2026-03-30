@@ -16,10 +16,8 @@ class Vehicle:
         self.vehicle = vehicle
         self.target_vel = 10
         self.dt = dt
-        self.steer_max = math.pi / 5
         self.speed_max = 40
         self.acc_max = 8
-        self.steer_max = np.deg2rad(35.0)
         self.steer_change_max = np.deg2rad(15.0)  # maximum steering speed [rad/s]
         wb_vec = vehicle.get_physics_control().wheels[0].position - vehicle.get_physics_control().wheels[2].position
         self.wheelbase = np.sqrt(wb_vec.x**2 + wb_vec.y**2 + wb_vec.z**2)/100

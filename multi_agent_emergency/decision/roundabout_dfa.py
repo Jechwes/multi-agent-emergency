@@ -1,70 +1,71 @@
 """
 roundabout_dfa.py
 =================
-Co-safety DFA for the roundabout driving task, compatible with
+Safety DFA for the roundabout driving task, compatible with
 FMTensJelmar's ``DFATree`` from ``dfa_tree_r1_risk_min.py``.
 
 Temporal-logic specification
 ----------------------------
-The co-safety (guarantee) specification encodes:
+Pure safety specification (no co-safety goal — vehicles circulate
+indefinitely):
 
-    φ = G( ¬non_drivable  ∧  ¬pedestrian  ∧  ¬other_car )
-
-i.e. **always** avoid non-drivable areas, pedestrians, and other cars.
+    ψ_s = G( ¬collision ∧ ¬non_drivable ∧ ¬pedestrian )
 
 The DFA has **two states**:
 
-    q_safe (0) : accepting AND initial.  The car is operating safely.
-                 Loops to itself on the 'safe' label.
+    q_safe (0) : accepting AND initial.  The vehicle is operating safely.
+                 Loops to itself on the 'drivable' label.
     q_fail (1) : absorbing failure state (sink).  Entered when any
                  atomic proposition is violated.
 
-Four letters encode the three atomic propositions plus the safe case:
+Four letters encode the atomic propositions:
 
-    col 0 → 'safe'          : ¬nd ∧ ¬ped ∧ ¬car       → q_safe → q_safe
-    col 1 → 'non_drivable'  : in a non-drivable area   → q_safe → q_fail
-    col 2 → 'pedestrian'    : collision with pedestrian → q_safe → q_fail
-    col 3 → 'other_car'     : collision with other car  → q_safe → q_fail
+    col 0 → 'drivable'      : all vehicles on drivable lanelets, no hazards
+                               → q_safe → q_safe
+    col 1 → 'non_drivable'  : some vehicle on a non-drivable lanelet
+                               → q_safe → q_fail
+    col 2 → 'pedestrian'    : pedestrian on a drivable lanelet
+                               → q_safe → q_fail
+    col 3 → 'collision'     : two vehicles share a lanelet
+                               → q_safe → q_fail
 
 Transition table ``trans[q, letter] → q'``:
 
     ┌──────────┬──────────┬──────────────┬─────────────┬────────────┐
-    │          │ safe (0) │ non_driv (1) │ ped (2)     │ car (3)    │
+    │          │ driv (0) │ non_driv (1) │ ped (2)     │ coll (3)   │
     ├──────────┼──────────┼──────────────┼─────────────┼────────────┤
     │ q_safe(0)│    0     │      1       │      1      │     1      │
     │ q_fail(1)│    1     │      1       │      1      │     1      │
     └──────────┴──────────┴──────────────┴─────────────┴────────────┘
 
-DFA.F    = 0   (accepting=initial=safe, root of the DFA tree)
+DFA.F    = 0   (accepting = initial = safe, root of the DFA tree)
 DFA.sink = 1   (absorbing failure)
 
-Offline vs online use
----------------------
-The DFATree is solved **offline** using only the 'safe' label mask (road
-geometry).  Since only ``trans[0,0]=0`` loops back to q_safe, the offline
-computation never needs to know where pedestrians or cars are.
-
-Online, ``classify_state()`` evaluates all three atomic propositions each
-tick and returns the appropriate letter.  The safety filter uses the
-associated ``risk_cost`` values to score proximity-based threats before
-any actual specification violation occurs.
+Labelling function
+------------------
+``classify_joint_state()`` takes the lanelet indices of all vehicles
+plus the pedestrian lanelet, and returns the worst-case letter over
+the joint state.  In single-agent mode a single-element list is
+passed and the collision check is trivially skipped.
 
 Risk-cost association
 ---------------------
-    'safe'          → 0.0       (no penalty)
+    'drivable'      → 0.0       (no penalty)
     'non_drivable'  → tuneable  (moderate)
     'pedestrian'    → tuneable  (high)
-    'other_car'     → tuneable  (high)
+    'collision'     → tuneable  (high)
 """
 
 from __future__ import annotations
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict, List, Optional
+
+from multi_agent_emergency.abstraction.roundabout_abstraction import LaneletGraph
 
 
 class RoundaboutDFA:
     """
-    Co-safety DFA for φ = G(¬non_drivable ∧ ¬pedestrian ∧ ¬other_car).
+    Safety DFA for ψ_s = G(¬collision ∧ ¬non_drivable ∧ ¬pedestrian).
 
     Compatible with DFATree from dfa_tree_r1_risk_min.py.
 
@@ -85,7 +86,7 @@ class RoundaboutDFA:
         self,
         cost_non_drivable: float = 40.0,
         cost_pedestrian: float = 500.0,
-        cost_other_car: float = 300.0,
+        cost_collision: float = 300.0,
     ) -> None:
         # --- DFA states ---
         # q_safe = 0 : accepting + initial (safe operation)
@@ -96,33 +97,33 @@ class RoundaboutDFA:
         self.S0 = 0              # initial state
 
         # --- Alphabet (4 letters) ---
-        #   col 0 = 'safe'          ¬nd ∧ ¬ped ∧ ¬car
-        #   col 1 = 'non_drivable'  in a non-drivable area
-        #   col 2 = 'pedestrian'    collision with pedestrian
-        #   col 3 = 'other_car'     collision with other car
-        self.act = ['safe', 'non_drivable', 'pedestrian', 'other_car']
+        #   col 0 = 'drivable'      all safe
+        #   col 1 = 'non_drivable'  vehicle on non-drivable lanelet
+        #   col 2 = 'pedestrian'    pedestrian on drivable lanelet
+        #   col 3 = 'collision'     two vehicles share a lanelet
+        self.act = ['drivable', 'non_drivable', 'pedestrian', 'collision']
 
         # --- Transition table  (|S| × |letters|) ---
         self.trans = np.array([
-            # safe  non_drivable  pedestrian  other_car
-            [  0,       1,            1,          1  ],  # q_safe
-            [  1,       1,            1,          1  ],  # q_fail: absorbing
+            # drivable  non_drivable  pedestrian  collision
+            [  0,          1,            1,          1  ],  # q_safe
+            [  1,          1,            1,          1  ],  # q_fail: absorbing
         ], dtype=int)
 
         # --- Label → column mapping ---
         self._label_to_col: Dict[str, int] = {
-            'safe':          0,
+            'drivable':      0,
             'non_drivable':  1,
             'pedestrian':    2,
-            'other_car':     3,
+            'collision':     3,
         }
 
         # --- Per-letter risk costs (used by the online safety filter) ---
         self.risk_cost: Dict[str, float] = {
-            'safe':          0.0,
+            'drivable':      0.0,
             'non_drivable':  cost_non_drivable,
             'pedestrian':    cost_pedestrian,
-            'other_car':     cost_other_car,
+            'collision':     cost_collision,
         }
 
     # ------------------------------------------------------------------
@@ -138,9 +139,10 @@ class RoundaboutDFA:
         return self.trans.shape[1]
 
     def label_to_column(self, label: str) -> int:
-        """Map a label string to its transition-table column index. Raises KeyError for unknown labels."""
+        """Map a label string to its transition-table column index."""
         if label not in self._label_to_col:
-            raise KeyError(f"Unknown DFA label '{label}'. Valid labels: {list(self._label_to_col)}")
+            raise KeyError(f"Unknown DFA label '{label}'. "
+                           f"Valid labels: {list(self._label_to_col)}")
         return self._label_to_col[label]
 
     def next_state(self, q: int, label: str) -> int:
@@ -158,43 +160,60 @@ class RoundaboutDFA:
         """Return the risk cost associated with a label."""
         return self.risk_cost.get(label, 0.0)
 
-    def classify_state(
+    # ------------------------------------------------------------------
+    # Joint-state labelling
+    # ------------------------------------------------------------------
+
+    def classify_joint_state(
         self,
-        d_ego: float,
-        lane_half_width: float,
-        lane_drivable: bool = True,
-        ped_nearby: bool = False,
-        car_nearby: bool = False,
+        vehicle_lanelet_indices: List[int],
+        graph: LaneletGraph,
+        ped_lanelet_idx: Optional[int] = None,
     ) -> str:
         """
-        Classify the current state into a DFA letter based on the
-        three atomic propositions of the co-safety specification.
+        Classify the joint state of all agents into a DFA letter.
 
-        The check order reflects severity (highest first):
-          1. pedestrian collision  → 'pedestrian'
-          2. other-car collision   → 'other_car'
-          3. non-drivable area     → 'non_drivable'
-          4. otherwise             → 'safe'
+        Works for both single-agent (list of one index) and multi-agent
+        (list of N indices) scenarios.
+
+        Check order reflects severity (highest first):
+          1. collision    — any two vehicles share the same lanelet
+          2. pedestrian   — pedestrian is on a drivable lanelet
+          3. non_drivable — any vehicle is on a non-drivable lanelet
+          4. drivable     — all clear
 
         Parameters
         ----------
-        d_ego          : lateral deviation from lane centre [m]
-        lane_half_width: half the lane width [m]
-        lane_drivable  : whether the current lane is drivable
-        ped_nearby     : True if a pedestrian is dangerously close
-        car_nearby     : True if another car is dangerously close
+        vehicle_lanelet_indices
+            Flat lanelet index for each vehicle.  For single-agent pass
+            a one-element list; the collision check is then trivially
+            skipped.
+        graph
+            LaneletGraph that knows which lanelets are drivable.
+        ped_lanelet_idx
+            Flat lanelet index of the pedestrian, or ``None`` if no
+            pedestrian is present.
 
         Returns
         -------
-        One of 'safe', 'non_drivable', 'pedestrian', 'other_car'.
+        One of 'drivable', 'non_drivable', 'pedestrian', 'collision'.
         """
-        if ped_nearby:
+        # 1. Collision: two or more vehicles on the same lanelet
+        if len(vehicle_lanelet_indices) > 1:
+            if len(set(vehicle_lanelet_indices)) < len(vehicle_lanelet_indices):
+                return 'collision'
+
+        # 2. Pedestrian on a drivable lanelet
+        if ped_lanelet_idx is not None and graph.is_lanelet_drivable(ped_lanelet_idx):
             return 'pedestrian'
-        if car_nearby:
-            return 'other_car'
-        if not lane_drivable or abs(d_ego) > lane_half_width:
-            return 'non_drivable'
-        return 'safe'
+
+        # 3. Any vehicle on a non-drivable lanelet
+        for idx in vehicle_lanelet_indices:
+            if not graph.is_lanelet_drivable(idx):
+                return 'non_drivable'
+
+        # 4. All clear
+        return 'drivable'
 
     # ------------------------------------------------------------------
     # Pretty printing
@@ -202,7 +221,7 @@ class RoundaboutDFA:
 
     def summary(self) -> str:
         lines = [
-            "RoundaboutDFA  (co-safety)  –  φ = G(¬nd ∧ ¬ped ∧ ¬car)",
+            "RoundaboutDFA  (safety)  –  ψ_s = G(¬collision ∧ ¬nd ∧ ¬ped)",
             f"  States : {self.S}",
             f"  Initial: {self.S0}  (= accepting)",
             f"  Accept : {self.F}",
@@ -216,5 +235,5 @@ class RoundaboutDFA:
         return "\n".join(lines)
 
     def __repr__(self) -> str:
-        return ("RoundaboutDFA(co-safety, "
-                "G(¬nd ∧ ¬ped ∧ ¬car), states=2, letters=4)")
+        return ("RoundaboutDFA(safety, "
+                "G(¬collision ∧ ¬nd ∧ ¬ped), states=2, letters=4)")

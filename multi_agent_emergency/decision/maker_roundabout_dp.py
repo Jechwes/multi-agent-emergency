@@ -4,21 +4,20 @@ maker_roundabout_dp.py
 Offline DP decision maker for the roundabout scenario using DFATree-based
 risk-minimising value iteration (``dfa_tree_r1_risk_min.py``).
 
-Two-policy architecture
------------------------
-Two DFATrees are built offline at startup:
+Single-tree architecture
+------------------------
+One DFATree is built offline at startup over all agent dimensions:
 
-  nominal  : state (s, d)    — arc-length and lateral deviation.
-             Action cost = -k_speed * v_s  (reward forward speed).
-             Policy maps (s, d) → (v_s, v_d).
+  - ego vehicle      : lanelet-graph transition matrix, controlled
+  - opponent vehicle : lanelet-graph transition matrix, controlled
+  - pedestrian       : Markov chain, uncontrolled
 
-  evasive  : state (Δs, d)   — ego-to-pedestrian gap and lateral deviation.
-             Action cost = +k_speed * v_s  (penalise speed to maintain gap).
-             Policy maps (Δs, d) → (v_s, v_d).
+For single-agent mode (no opponent), only the ego + pedestrian
+dimensions are included.
 
-Both policies are decoupled 1-D single-integrators; the same Frenet
-dimensions are shared across all sections.  Lane changes are not part
-of the DP — they are handled by the safety filter.
+Online, ``get_action(...)`` returns a discrete action index per
+controlled vehicle by looking up the offline policy at the current
+lanelet indices.
 """
 
 from __future__ import annotations
@@ -45,58 +44,60 @@ class RoundaboutDPDecisionMaker:
     """
     Offline DP solver + online policy lookup.
 
-    Offline DP solver for both the nominal and evasive policies.
-
-    Builds TWO DFATrees offline (one nominal, one evasive), then provides:
-      - ``get_action(s, d, policy_type)`` → (v_s, v_d)  policy lookup
-      - ``get_value(s, d, policy_type)``  → float        value function query
-
-    For the evasive policy, the first argument to get_action/get_value is
-    Δs (ego-to-pedestrian gap), not arc-length s.
+    Builds ONE DFATree offline over all agent dimensions, then provides:
+      - ``get_action(...)``  → discrete action index per controlled vehicle
+      - ``get_value(...)``   → factored risk value at the current joint state
 
     Parameters
     ----------
-    dfa              : RoundaboutDFA instance
-    abs_data_nominal : dict returned by ``build_abstraction()``
-    abs_data_evasive : dict returned by ``build_relative_abstraction()``
-    gamma            : discount factor
+    dfa           : RoundaboutDFA instance
+    abs_data      : dict with keys produced by the new lanelet-graph
+                    abstraction builders:
+                      'P_ego', 'P_opp'       : transition matrices (optional opp)
+                      'L_ego', 'L_opp'       : label matrices
+                      'state_cost_ego/opp'   : state cost vectors
+                      'action_cost_ego/opp'  : action cost vectors
+                      'n_lanelets'           : number of lanelets
+                      'ped_data'             : dict with P_p, centres_p, rho_p (optional)
+                      'L_p', 'cost_p'        : pedestrian labels/cost (optional)
+    gamma         : discount factor
     n_tree_iters, n_vi_per_iter, n_grow : DFATree solver parameters
     """
+
     def __init__(
         self,
         dfa,
-        abs_data_nominal: Dict,
-        abs_data_evasive: Dict,
+        abs_data: Dict,
         gamma: float = 0.5,
         n_tree_iters: int = 3,
         n_vi_per_iter: int = 10,
         n_grow: int = 2,
     ) -> None:
         self.dfa = dfa
-        self.abs_data_nominal = abs_data_nominal
-        self.abs_data_evasive = abs_data_evasive
+        self.abs_data = abs_data
         self.gamma = gamma
 
-        # --- Nominal action/grid arrays ---
-        self.acc_s_nominal = abs_data_nominal['acc_s']
-        self.acc_d_nominal = abs_data_nominal['acc_d']
-        self.centres_s_nominal = abs_data_nominal['centres_s']
-        self.centres_d_nominal = abs_data_nominal['centres_d']
+        self.n_lanelets = abs_data['n_lanelets']
+        self.has_opponent = 'P_opp' in abs_data
+        self.has_pedestrian = (abs_data.get('ped_data') is not None
+                               and abs_data.get('L_p') is not None)
 
-        # --- Evasive action/grid arrays ---
-        self.acc_s_evasive = abs_data_evasive['acc_s']
-        self.acc_d_evasive = abs_data_evasive['acc_d']
-        self.centres_s_evasive = abs_data_evasive['centres_s']
-        self.centres_d_evasive = abs_data_evasive['centres_d']
+        # Dimension index bookkeeping
+        self.dim_ego = 0
+        self.dim_opp: Optional[int] = None
+        self.dim_ped: Optional[int] = None
 
-        # Build two DFATrees (offline)
-        print("[DP] Building nominal tree...")
-        self.tree_nominal = self._build_tree(
-            self.abs_data_nominal, n_tree_iters, n_vi_per_iter, n_grow
-        )
-        print("[DP] Building evasive tree...")
-        self.tree_evasive = self._build_tree(
-            self.abs_data_evasive, n_tree_iters, n_vi_per_iter, n_grow
+        next_dim = 1
+        if self.has_opponent:
+            self.dim_opp = next_dim
+            next_dim += 1
+        if self.has_pedestrian:
+            self.dim_ped = next_dim
+
+        # Build the single DFATree (offline)
+        print("[DP] Building tree...")
+        self.tree = self._build_tree(
+            abs_data, n_tree_iters, n_vi_per_iter, n_grow
         )
 
         # Current DFA state (for online tracking)
@@ -113,33 +114,47 @@ class RoundaboutDPDecisionMaker:
         n_vi_per_iter: int,
         n_grow: int,
     ) -> DFATree:
-        """Build and solve a single DFATree from the abstraction."""
-        d = abs_data
-        N_s = len(d['centres_s'])
-        N_d = len(d['centres_d'])
+        """
+        Assemble dimensions and solve a single DFATree.
 
-        sysAbs = [SysAbs1D(d['P_s']), SysAbs1D(d['P_d'])]
-        nx_list = [N_s, N_d]
-        L = [d['L_s'], d['L_d']]
-        cost_map = [d['state_cost_s'], d['state_cost_d']]
-        action_cost_list = [d['action_cost_s'], d['action_cost_d']]
-        rho = [
-            np.ones(N_s, dtype=float) / N_s,
-            np.ones(N_d, dtype=float) / N_d,
-        ]
+        Dimensions are added in order:
+          0 : ego vehicle      (controlled)
+          1 : opponent vehicle (controlled, only if present)
+          ? : pedestrian       (uncontrolled, only if present)
 
-        # Only add pedestrian dimension if it was actually built
-        ped = d.get('ped_data')
-        if ped is not None and 'P_p' in ped and d.get('L_p') is not None:
+        Single-agent mode omits the opponent dimension entirely.
+        """
+        N = self.n_lanelets
+
+        # -- always: ego dimension --
+        sysAbs = [SysAbs1D(abs_data['P_ego'])]
+        nx_list = [N]
+        L = [abs_data['L_ego']]
+        cost_map = [abs_data['state_cost_ego']]
+        action_cost_list = [abs_data['action_cost_ego']]
+        rho = [np.ones(N, dtype=float) / N]
+
+        # -- optional: opponent dimension --
+        if self.has_opponent:
+            sysAbs.append(SysAbs1D(abs_data['P_opp']))
+            nx_list.append(N)
+            L.append(abs_data['L_opp'])
+            cost_map.append(abs_data['state_cost_opp'])
+            action_cost_list.append(abs_data['action_cost_opp'])
+            rho.append(np.ones(N, dtype=float) / N)
+
+        # -- optional: pedestrian dimension (uncontrolled) --
+        if self.has_pedestrian:
+            ped = abs_data['ped_data']
             N_p = len(ped['centres_p'])
-            if N_p >= 2:                          # ← extra safety check
-                sysAbs.append(SysAbs1D(ped['P_p']))
-                nx_list.append(N_p)
-                L.append(d['L_p'])
-                cost_map.append(d['cost_p'])
-                action_cost_list.append(None)     # uncontrolled
-                rho.append(ped['rho_p'])
+            sysAbs.append(SysAbs1D(ped['P_p']))
+            nx_list.append(N_p)
+            L.append(abs_data['L_p'])
+            cost_map.append(abs_data['cost_p'])
+            action_cost_list.append(None)   # uncontrolled
+            rho.append(ped['rho_p'])
 
+        # -- initialise policy array --
         n_dims = len(sysAbs)
         n_dfa_states = self.dfa.n_states
         pol_init = np.empty((n_dfa_states, n_dims), dtype=object)
@@ -179,86 +194,111 @@ class RoundaboutDPDecisionMaker:
         return tree
 
     # ------------------------------------------------------------------
-    # Online: policy lookup  (no online solving)
+    # Online: policy lookup
     # ------------------------------------------------------------------
 
     def get_action(
-        self, s: float, d: float, policy_type: str = 'nominal'
-    ) -> Tuple[float, float]:
+        self,
+        ego_lanelet: int,
+        opp_lanelet: Optional[int] = None,
+    ) -> Tuple[int, Optional[int]]:
         """
-        Look up the offline policy at state (s, d).
+        Look up the offline policy at the current lanelet indices.
 
-        For policy_type='nominal', s is arc-length within the section.
-        For policy_type='evasive', s is Δs (ego-to-pedestrian gap).
-        Returns (v_s, v_d) speed targets.
+        Parameters
+        ----------
+        ego_lanelet : flat lanelet index of ego vehicle.
+        opp_lanelet : flat lanelet index of opponent vehicle, or ``None``
+                      in single-agent mode.
+
+        Returns
+        -------
+        (action_ego, action_opp)
+            Discrete action indices (0=advance, 1=lane_in, 2=lane_out,
+            3=yield).  ``action_opp`` is ``None`` in single-agent mode.
         """
         q = self.q_current
         if q == int(self.dfa.sink):
-            return 0.0, 0.0
+            # In the failure state, yield for all vehicles
+            yield_action = 3
+            return yield_action, (yield_action if self.has_opponent else None)
 
-        if policy_type == 'evasive':
-            tree = self.tree_evasive
-            i_s = self._to_index(s, self.centres_s_evasive)
-            i_d = self._to_index(d, self.centres_d_evasive)
-            acc_s = self.acc_s_evasive
-            acc_d = self.acc_d_evasive
-        else:
-            tree = self.tree_nominal
-            i_s = self._to_index(s, self.centres_s_nominal)
-            i_d = self._to_index(d, self.centres_d_nominal)
-            acc_s = self.acc_s_nominal
-            acc_d = self.acc_d_nominal
+        # -- ego action --
+        action_ego = self._lookup_action(q, self.dim_ego, ego_lanelet)
 
-        pol_s = tree.pol[q][0]
-        pol_d = tree.pol[q][1]
+        # -- opponent action (if present) --
+        action_opp: Optional[int] = None
+        if self.has_opponent and opp_lanelet is not None:
+            action_opp = self._lookup_action(q, self.dim_opp, opp_lanelet)
 
-        if hasattr(pol_s, 'toarray'):
-            pol_s = pol_s.toarray()
-        if hasattr(pol_d, 'toarray'):
-            pol_d = pol_d.toarray()
+        return action_ego, action_opp
 
-        a_s = int(np.argmax(pol_s[i_s, :]))
-        a_d = int(np.argmax(pol_d[i_d, :]))
+    def _lookup_action(self, q: int, dim: int, lanelet_idx: int) -> int:
+        """Extract the greedy action from tree.pol[q][dim] at lanelet_idx."""
+        pol = self.tree.pol[q][dim]
+        if pol is None:
+            return 3  # yield as fallback if policy not computed
+        if hasattr(pol, 'toarray'):
+            pol = pol.toarray()
+        
+        if lanelet_idx < 0 or lanelet_idx >= pol.shape[0]:
+            print(f"[Warning] Lanelet index {lanelet_idx} out of bounds for policy shape {pol.shape}. Falling back to yield.")
+            return 3
+            
+        return int(np.argmax(pol[lanelet_idx, :]))
 
-        return float(acc_s[a_s]), float(acc_d[a_d])
+    # ------------------------------------------------------------------
+    # Online: value query
+    # ------------------------------------------------------------------
 
     def get_value(
-        self, s: float, d: float, policy_type: str = 'nominal'
+        self,
+        ego_lanelet: int,
+        opp_lanelet: Optional[int] = None,
+        ped_state: Optional[int] = None,
     ) -> float:
         """
-        Query the risk value at state (s, d).
+        Factored risk value at the current joint state.
 
-        For policy_type='nominal', s is arc-length within the section.
-        For policy_type='evasive', s is Δs (ego-to-pedestrian gap).
+        Computes  Σ_n  ∏_d  V[d][n, idx_d]  over tree nodes and all
+        active dimensions (ego × opponent × pedestrian).
+
+        Parameters
+        ----------
+        ego_lanelet : flat lanelet index of ego vehicle.
+        opp_lanelet : flat lanelet index of opponent, or ``None``.
+        ped_state   : pedestrian grid index, or ``None``.
+
+        Returns
+        -------
+        float — total risk value (lower is safer).
         """
         q = self.q_current
         if q == int(self.dfa.sink):
             return float('inf')
 
-        if policy_type == 'evasive':
-            tree = self.tree_evasive
-            i_s = self._to_index(s, self.centres_s_evasive)
-            i_d = self._to_index(d, self.centres_d_evasive)
-        else:
-            tree = self.tree_nominal
-            i_s = self._to_index(s, self.centres_s_nominal)
-            i_d = self._to_index(d, self.centres_d_nominal)
+        # Build list of (dimension_index, state_index) pairs
+        dims_and_indices: List[Tuple[int, int]] = [(self.dim_ego, ego_lanelet)]
+
+        if self.has_opponent and opp_lanelet is not None:
+            dims_and_indices.append((self.dim_opp, opp_lanelet))
+
+        if self.has_pedestrian and ped_state is not None:
+            dims_and_indices.append((self.dim_ped, ped_state))
 
         total = 0.0
-        for n in tree.Q.get(q, []):
-            total += float(tree.V[0][n, i_s]) * float(tree.V[1][n, i_d])
+        for n in self.tree.Q.get(q, []):
+            product = 1.0
+            for dim, idx in dims_and_indices:
+                product *= float(self.tree.V[dim][n, idx])
+            total += product
         return total
+
+    # ------------------------------------------------------------------
+    # Online: DFA state tracking
+    # ------------------------------------------------------------------
 
     def update_dfa_state(self, label: str) -> int:
         """Advance the DFA state given the observed label."""
         self.q_current = self.dfa.next_state(self.q_current, label)
         return self.q_current
-
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _to_index(val: float, centres: np.ndarray) -> int:
-        """Find nearest grid cell index."""
-        return int(np.argmin(np.abs(centres - val)))
