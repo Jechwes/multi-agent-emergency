@@ -189,8 +189,8 @@ def main():
     argparser = argparse.ArgumentParser(description='Roundabout DP + MPC')
     argparser.add_argument('--host', default='127.0.0.1', help='Host IP')
     argparser.add_argument('-p', '--port', default=2000, type=int)
-    argparser.add_argument('--multi-agent', action='store_true',
-                           help='Add opponent vehicle (default: ego only)')
+    argparser.add_argument('--multi-agent', action='store_true', default=True,
+                           help='Add opponent vehicle (default: True)')
     args = argparser.parse_args()
     running = True
     env = None
@@ -209,8 +209,9 @@ def main():
     DRIVABLE_LANES = (1, 2)
 
     # Vehicle lanes
-    EGO_LANE     = 2
+    EGO_LANE     = 1
     OPP_LANE     = 1
+    OPP2_LANE    = 2
 
     # DP parameters
     GAMMA        = 0.5
@@ -284,12 +285,16 @@ def main():
             carla.Transform(carla.Location(z=50), carla.Rotation(pitch=-90))
         )
 
-        # Opponent (only in multi-agent mode)
+        # Opponents (only in multi-agent mode)
         opp_car = None
         opp_model = None
         opp_controller = None
+        opp2_car = None
+        opp2_model = None
+        opp2_controller = None
 
         if multi_agent:
+            # Opponent 1
             opp_section = (start_section_ego + 6) % N_SECTIONS
             sl_opp = rmap.get_section_lanelet(opp_section, OPP_LANE)
             cart_opp = sl_opp.to_cartesian(0.5 * sl_opp.arc_length, 0.0)
@@ -298,8 +303,21 @@ def main():
                 carla.Rotation(yaw=math.degrees(cart_opp.heading)),
             )
             opp_car = env.add_car(opp_sp, "200, 50, 50")
-            print(f"Opp spawn: section={opp_section}, "
+            print(f"Opp1 spawn: section={opp_section}, "
                   f"x={cart_opp.x:.2f}, y={cart_opp.y:.2f}")
+            env.world.tick()
+
+            # Opponent 2
+            opp2_section = (start_section_ego + 12) % N_SECTIONS
+            sl_opp2 = rmap.get_section_lanelet(opp2_section, OPP2_LANE)
+            cart_opp2 = sl_opp2.to_cartesian(0.5 * sl_opp2.arc_length, 0.0)
+            opp2_sp = carla.Transform(
+                carla.Location(x=cart_opp2.x, y=cart_opp2.y, z=0.3),
+                carla.Rotation(yaw=math.degrees(cart_opp2.heading)),
+            )
+            opp2_car = env.add_car(opp2_sp, "50, 50, 200")
+            print(f"Opp2 spawn: section={opp2_section}, "
+                  f"x={cart_opp2.x:.2f}, y={cart_opp2.y:.2f}")
             env.world.tick()
 
         # Pedestrian on outer edge
@@ -326,6 +344,10 @@ def main():
         if opp_car is not None:
             opp_model = model.Vehicle(opp_car, env.dt, origin)
             opp_controller = MPC_controller(opp_model)
+
+        if opp2_car is not None:
+            opp2_model = model.Vehicle(opp2_car, env.dt, origin)
+            opp2_controller = MPC_controller(opp2_model)
 
         MPC_DT      = ego_controller.dt
         MPC_HORIZON = ego_controller.horizon
@@ -420,6 +442,7 @@ def main():
         step = 0
         ego_lane = EGO_LANE
         opp_lane = OPP_LANE
+        opp2_lane = OPP2_LANE
         LOG_INTERVAL = 50
 
         _ACTION_NAMES = ['advance', 'lane_in', 'lane_out', 'yield']
@@ -432,6 +455,8 @@ def main():
             ego_model.update()
             if opp_model is not None:
                 opp_model.update()
+            if opp2_model is not None:
+                opp2_model.update()
 
             # Update pedestrian patrol
             env.update_pedestrian_patrol(
@@ -492,10 +517,41 @@ def main():
                 opp_lane = lane_opp_det
                 opp_idx = graph.to_index(sec_opp, opp_lane)
 
+            # Opponent 2 Frenet (if present)
+            opp2_idx = None
+            sec_opp2 = None
+            s_opp2 = 0.0
+            d_opp2 = 0.0
+            v_opp2 = 0.0
+
+            if opp2_model is not None:
+                opp2_xy = np.array([opp2_model.x, opp2_model.y])
+                v_opp2 = opp2_model.v
+                opp2_yaw = opp2_model.yaw
+
+                sec_opp2, lane_opp2_det, frenet_opp2 = rmap.to_frenet(
+                    opp2_xy, speed=v_opp2, yaw=opp2_yaw,
+                )
+                s_opp2 = frenet_opp2.s
+                d_opp2 = frenet_opp2.d
+
+                if lane_opp2_det not in DRIVABLE_LANES:
+                    lane_opp2_det = min(DRIVABLE_LANES,
+                                        key=lambda l: abs(l - lane_opp2_det))
+                    sl_snap_o2 = rmap.get_section_lanelet(sec_opp2, lane_opp2_det)
+                    frenet_opp2 = sl_snap_o2.to_frenet(
+                        opp2_xy, speed=v_opp2, yaw=opp2_yaw)
+                    s_opp2 = frenet_opp2.s
+                    d_opp2 = frenet_opp2.d
+                opp2_lane = lane_opp2_det
+                opp2_idx = graph.to_index(sec_opp2, opp2_lane)
+
             # -- 3. Update DFA state --
             vehicle_indices = [ego_idx]
             if opp_idx is not None:
                 vehicle_indices.append(opp_idx)
+            if opp2_idx is not None:
+                vehicle_indices.append(opp2_idx)
 
             # Pedestrian lanelet (if visible)
             ped_lanelet_idx = None
@@ -569,6 +625,30 @@ def main():
 
             ref_opp = None
             if opp_model is not None and action_opp is not None:
+                # Safety filter for opponent
+                stage_costs_opp = []
+                for k in range(SF_HORIZON):
+                    future_sec_opp = (sec_opp + k) % N_SECTIONS
+                    cost_k_opp, _ = safety_filter.stage_risk_cost(
+                        ego_section=future_sec_opp,
+                        ego_lane=opp_lane,
+                        n_sections=N_SECTIONS,
+                        ped_section=ped_section if ped_lanelet_idx is not None else None,
+                        ped_lane=ped_lane_id if ped_lanelet_idx is not None else None,
+                        opp_section=sec_ego,
+                        opp_lane=ego_lane,
+                    )
+                    stage_costs_opp.append(cost_k_opp)
+
+                pred_risk_opp = SafetyFilter.predicted_horizon_risk(stage_costs_opp, SF_GAMMA)
+                risk_mode_opp = SafetyFilter.select_mode(pred_risk_opp, SF_SOFT_THRESH, SF_HARD_THRESH)
+
+                v_cruise_opp = 10.0
+                if risk_mode_opp == RiskLevel.BRAKE:
+                    action_opp = _ACT_YIELD
+                elif risk_mode_opp == RiskLevel.CAUTION:
+                    v_cruise_opp = 10.0 * SF_CAUTION_SPEED
+
                 ref_opp, _, _ = build_mpc_reference_lanelet(
                     action=action_opp,
                     rmap=rmap,
@@ -576,6 +656,50 @@ def main():
                     section=sec_opp, lane=opp_lane,
                     mpc_dt=MPC_DT, mpc_horizon=MPC_HORIZON,
                     lane_width=LANE_WIDTH,
+                    v_cruise=v_cruise_opp,
+                )
+
+            # Opponent 2: safety filter + MPC reference
+            ref_opp2 = None
+            pred_risk_opp2 = 0.0
+            risk_mode_opp2 = RiskLevel.NOMINAL
+            action_opp2 = _ACT_ADVANCE
+            if opp2_model is not None:
+                # Use same DP policy lookup for opp2 (as ego dimension)
+                action_opp2 = maker._lookup_action(
+                    maker.q_current, maker.dim_ego, opp2_idx)
+
+                stage_costs_opp2 = []
+                for k in range(SF_HORIZON):
+                    future_sec_opp2 = (sec_opp2 + k) % N_SECTIONS
+                    cost_k_opp2, _ = safety_filter.stage_risk_cost(
+                        ego_section=future_sec_opp2,
+                        ego_lane=opp2_lane,
+                        n_sections=N_SECTIONS,
+                        ped_section=ped_section if ped_lanelet_idx is not None else None,
+                        ped_lane=ped_lane_id if ped_lanelet_idx is not None else None,
+                        opp_section=sec_ego,
+                        opp_lane=ego_lane,
+                    )
+                    stage_costs_opp2.append(cost_k_opp2)
+
+                pred_risk_opp2 = SafetyFilter.predicted_horizon_risk(stage_costs_opp2, SF_GAMMA)
+                risk_mode_opp2 = SafetyFilter.select_mode(pred_risk_opp2, SF_SOFT_THRESH, SF_HARD_THRESH)
+
+                v_cruise_opp2 = 10.0
+                if risk_mode_opp2 == RiskLevel.BRAKE:
+                    action_opp2 = _ACT_YIELD
+                elif risk_mode_opp2 == RiskLevel.CAUTION:
+                    v_cruise_opp2 = 10.0 * SF_CAUTION_SPEED
+
+                ref_opp2, _, _ = build_mpc_reference_lanelet(
+                    action=action_opp2,
+                    rmap=rmap,
+                    s0=s_opp2, d0=d_opp2, v0=v_opp2,
+                    section=sec_opp2, lane=opp2_lane,
+                    mpc_dt=MPC_DT, mpc_horizon=MPC_HORIZON,
+                    lane_width=LANE_WIDTH,
+                    v_cruise=v_cruise_opp2,
                 )
 
             # -- 6. Solve MPC and apply controls --
@@ -592,8 +716,17 @@ def main():
                     ctrl_opp = opp_controller.solve_trajectory(ref_opp)
                     opp_car.apply_control(ctrl_opp)
                 except Exception as e:
-                    print(f"[warning] MPC Opp failed: {e}. Applying hard brake.")
+                    print(f"[warning] MPC Opp1 failed: {e}. Applying hard brake.")
                     opp_car.apply_control(
+                        carla.VehicleControl(brake=1.0, throttle=0.0))
+
+            if opp2_controller is not None and ref_opp2 is not None:
+                try:
+                    ctrl_opp2 = opp2_controller.solve_trajectory(ref_opp2)
+                    opp2_car.apply_control(ctrl_opp2)
+                except Exception as e:
+                    print(f"[warning] MPC Opp2 failed: {e}. Applying hard brake.")
+                    opp2_car.apply_control(
                         carla.VehicleControl(brake=1.0, throttle=0.0))
 
             # -- Logging --
@@ -601,12 +734,19 @@ def main():
                 msg = (f"[step {step:05d}] ego=({sec_ego},{ego_lane}) "
                        f"act={_ACTION_NAMES[action_ego]}")
                 if action_opp is not None:
-                    msg += (f"  opp=({sec_opp},{opp_lane}) "
-                            f"act={_ACTION_NAMES[action_opp]}")
-                msg += f"  dfa={dfa_label}  v={ego_v:.1f}m/s  risk={pred_risk:.0f} mode={risk_mode.name}"
-                msg2 = f"[risk] acc_risk={pred_risk:.1f}"
+                    msg += (f"  opp1=({sec_opp},{opp_lane}) "
+                            f"act={_ACTION_NAMES[action_opp]} v={v_opp:.1f}m/s")
+                if opp2_model is not None:
+                    msg += (f"  opp2=({sec_opp2},{opp2_lane}) "
+                            f"act={_ACTION_NAMES[action_opp2]} v={v_opp2:.1f}m/s")
+                msg += f"  dfa={dfa_label}"
                 print(msg)
-                print(msg2)
+                risk_msg = f"[risk] ego={pred_risk:.1f}/{risk_mode.name}"
+                if opp_model is not None:
+                    risk_msg += f"  opp1={pred_risk_opp:.1f}/{risk_mode_opp.name}"
+                if opp2_model is not None:
+                    risk_msg += f"  opp2={pred_risk_opp2:.1f}/{risk_mode_opp2.name}"
+                print(risk_msg)
 
     finally:
         if env is not None:
