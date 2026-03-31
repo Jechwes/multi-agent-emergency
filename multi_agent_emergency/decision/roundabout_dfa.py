@@ -6,21 +6,26 @@ FMTensJelmar's ``DFATree`` from ``dfa_tree_r1_risk_min.py``.
 
 Temporal-logic specification
 ----------------------------
-    ψ = G( ¬collision ∧ ¬non_drivable ) ∧ (pedestrian → yield)
+    ψ = G( ¬collision ∧ ¬non_drivable ∧ ¬pedestrian )
 
-The DFA has **three states**:
+The DFA has **two states**:
 
     q_safe (0) : accepting AND initial.  Normal driving.
-    q_ped  (1) : pedestrian nearby.  Vehicle should yield / change lane.
-                 Returns to q_safe when the pedestrian clears ('drivable').
-    q_fail (2) : absorbing failure state (sink).  Entered on collision
-                 or non-drivable violation.
+    q_fail (1) : absorbing failure state (sink).  Entered on collision,
+                 non-drivable violation, or pedestrian occupying the
+                 same cell.
+
+The safety filter prevents failures by accumulating risk over the
+look-ahead horizon.  Each hazard (pedestrian, non-drivable, other
+vehicle) carries a cost that grows with proximity.  When accumulated
+risk exceeds the threshold, the filter overrides the DP action to
+yield before the car reaches the hazard.
 
 Four letters encode the atomic propositions:
 
     col 0 → 'drivable'      : all clear
     col 1 → 'non_drivable'  : vehicle on non-drivable lanelet  → fail
-    col 2 → 'pedestrian'    : pedestrian near a vehicle         → q_ped
+    col 2 → 'pedestrian'    : pedestrian occupies same cell     → fail
     col 3 → 'collision'     : two vehicles share a lanelet      → fail
 
 Transition table ``trans[q, letter] → q'``:
@@ -28,13 +33,12 @@ Transition table ``trans[q, letter] → q'``:
     ┌──────────┬──────────┬──────────────┬─────────────┬────────────┐
     │          │ driv (0) │ non_driv (1) │ ped (2)     │ coll (3)   │
     ├──────────┼──────────┼──────────────┼─────────────┼────────────┤
-    │ q_safe(0)│    0     │      2       │      1      │     2      │
-    │ q_ped (1)│    0     │      2       │      1      │     2      │
-    │ q_fail(2)│    2     │      2       │      2      │     2      │
+    │ q_safe(0)│    0     │      1       │      1      │     1      │
+    │ q_fail(1)│    1     │      1       │      1      │     1      │
     └──────────┴──────────┴──────────────┴─────────────┴────────────┘
 
 DFA.F    = 0   (accepting = initial = safe, root of the DFA tree)
-DFA.sink = 2   (absorbing failure)
+DFA.sink = 1   (absorbing failure)
 
 Labelling function
 ------------------
@@ -60,19 +64,23 @@ from abstraction.roundabout_abstraction import LaneletGraph
 
 class RoundaboutDFA:
     """
-    Three-state safety DFA:
+    Two-state safety DFA:
         q_safe(0) — normal driving (accepting + initial)
-        q_ped(1)  — pedestrian nearby, should yield / evade
-        q_fail(2) — absorbing failure (sink)
+        q_fail(1) — absorbing failure (sink)
+
+    Any hazard (non-drivable, pedestrian, collision) transitions to
+    q_fail.  The online safety filter prevents this by accumulating
+    risk over the look-ahead horizon and making the car yield before
+    it reaches any hazard.
 
     Compatible with DFATree from dfa_tree_r1_risk_min.py.
 
     Attributes expected by DFATree
     ------------------------------
-    S     : list of states [0, 1, 2]
+    S     : list of states [0, 1]
     F     : int, accepting state id  (= 0, also initial)
-    sink  : int, absorbing failure   (= 2)
-    trans : np.ndarray  (3, 4) with target state ids
+    sink  : int, absorbing failure   (= 1)
+    trans : np.ndarray  (2, 4) with target state ids
     act   : list of human-readable letter names  (length 4)
 
     Safety-filter extras
@@ -88,26 +96,24 @@ class RoundaboutDFA:
     ) -> None:
         # --- DFA states ---
         # q_safe = 0 : accepting + initial (normal driving)
-        # q_ped  = 1 : pedestrian nearby   (should yield)
-        # q_fail = 2 : absorbing failure
-        self.S  = [0, 1, 2]
+        # q_fail = 1 : absorbing failure
+        self.S  = [0, 1]
         self.F  = 0              # accepting state  (root of the DFA tree)
-        self.sink = 2            # absorbing failure state
+        self.sink = 1            # absorbing failure state
         self.S0 = 0              # initial state
 
         # --- Alphabet (4 letters) ---
         #   col 0 = 'drivable'      all safe
         #   col 1 = 'non_drivable'  vehicle on non-drivable lanelet
-        #   col 2 = 'pedestrian'    pedestrian near a vehicle
+        #   col 2 = 'pedestrian'    pedestrian occupies same cell
         #   col 3 = 'collision'     two vehicles share a lanelet
         self.act = ['drivable', 'non_drivable', 'pedestrian', 'collision']
 
         # --- Transition table  (|S| × |letters|) ---
         self.trans = np.array([
             # drivable  non_drivable  pedestrian  collision
-            [  0,          2,            1,          2  ],  # q_safe → q_ped on ped
-            [  0,          2,            1,          2  ],  # q_ped  → q_safe on clear
-            [  2,          2,            2,          2  ],  # q_fail: absorbing
+            [  0,          1,            1,          1  ],  # q_safe: any hazard → fail
+            [  1,          1,            1,          1  ],  # q_fail: absorbing
         ], dtype=int)
 
         # --- Label → column mapping ---
@@ -169,7 +175,6 @@ class RoundaboutDFA:
         vehicle_lanelet_indices: List[int],
         graph: LaneletGraph,
         ped_lanelet_idx: Optional[int] = None,
-        ped_proximity_sections: int = 2,
     ) -> str:
         """
         Classify the joint state of all agents into a DFA letter.
@@ -179,9 +184,8 @@ class RoundaboutDFA:
 
         Check order reflects severity (highest first):
           1. collision    — any two vehicles share the same lanelet
-          2. pedestrian   — pedestrian is on a drivable lanelet AND
-                            within ``ped_proximity_sections`` sections
-                            of any vehicle
+          2. pedestrian   — a vehicle occupies the same lanelet as the
+                            pedestrian
           3. non_drivable — any vehicle is on a non-drivable lanelet
           4. drivable     — all clear
 
@@ -196,9 +200,6 @@ class RoundaboutDFA:
         ped_lanelet_idx
             Flat lanelet index of the pedestrian, or ``None`` if no
             pedestrian is present.
-        ped_proximity_sections
-            Maximum section distance between a vehicle and the pedestrian
-            for the pedestrian label to trigger.
 
         Returns
         -------
@@ -209,19 +210,10 @@ class RoundaboutDFA:
             if len(set(vehicle_lanelet_indices)) < len(vehicle_lanelet_indices):
                 return 'collision'
 
-        # 2. Pedestrian on a drivable lanelet AND close to a vehicle
-        if ped_lanelet_idx is not None and graph.is_lanelet_drivable(ped_lanelet_idx):
-            ped_sec, _ = graph.from_index(ped_lanelet_idx)
-            n_sec = graph.n_sections
-            for v_idx in vehicle_lanelet_indices:
-                v_sec, _ = graph.from_index(v_idx)
-                # Circular section distance
-                sec_dist = min(
-                    abs(v_sec - ped_sec),
-                    n_sec - abs(v_sec - ped_sec),
-                )
-                if sec_dist <= ped_proximity_sections:
-                    return 'pedestrian'
+        # 2. Pedestrian: a vehicle shares the same lanelet as the pedestrian
+        if ped_lanelet_idx is not None:
+            if ped_lanelet_idx in vehicle_lanelet_indices:
+                return 'pedestrian'
 
         # 3. Any vehicle on a non-drivable lanelet
         for idx in vehicle_lanelet_indices:
@@ -237,7 +229,7 @@ class RoundaboutDFA:
 
     def summary(self) -> str:
         lines = [
-            "RoundaboutDFA  (3-state)  –  q_safe / q_ped / q_fail",
+            "RoundaboutDFA  (2-state)  –  q_safe / q_fail",
             f"  States : {self.S}",
             f"  Initial: {self.S0}  (= accepting)",
             f"  Accept : {self.F}",
@@ -251,4 +243,4 @@ class RoundaboutDFA:
         return "\n".join(lines)
 
     def __repr__(self) -> str:
-        return ("RoundaboutDFA(3-state: q_safe/q_ped/q_fail, letters=4)")
+        return ("RoundaboutDFA(2-state: q_safe/q_fail, letters=4)")
