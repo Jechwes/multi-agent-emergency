@@ -49,8 +49,10 @@ from abstraction.roundabout_abstraction import (
     build_state_cost,
     build_action_cost,
     build_pedestrian_chain,
-    _build_pedestrian_labels,
-    _build_pedestrian_cost,
+    build_pedestrian_labels,
+    build_pedestrian_cost,
+    ped_flat_index,
+    ped_lateral_from_radius,
 )
 
 from decision.roundabout_dfa import RoundaboutDFA
@@ -352,16 +354,25 @@ def main():
         state_cost_ego = build_state_cost(graph, NON_DRIVABLE_PENALTY_EGO)
         action_cost_ego = build_action_cost(ADVANCE_REWARD, LANE_CHANGE_COST)
 
-        # Pedestrian chain
+        # Pedestrian chain (2-D: section × lateral band)
         ped_data = None
         L_p = None
         cost_p = None
         if N_P >= 2:
-            ped_data = build_pedestrian_chain(N_P, LANE_WIDTH, N_LANES, P_MOVE)
-            L_p = _build_pedestrian_labels(
-                ped_data['centres_p'], LANE_WIDTH, N_LANES, EGO_LANE)
-            cost_p = _build_pedestrian_cost(
-                ped_data['centres_p'], LANE_WIDTH, N_LANES, EGO_LANE,
+            ped_data = build_pedestrian_chain(
+                N_lateral=N_P,
+                n_sections=N_SECTIONS,
+                lane_width=LANE_WIDTH,
+                n_lanes=N_LANES,
+                p_move=P_MOVE,
+                ped_section=PED_SECTION,
+            )
+            L_p = build_pedestrian_labels(
+                ped_data['centres_p'], N_SECTIONS, LANE_WIDTH,
+                N_LANES, list(DRIVABLE_LANES))
+            cost_p = build_pedestrian_cost(
+                ped_data['centres_p'], N_SECTIONS, LANE_WIDTH,
+                N_LANES, list(DRIVABLE_LANES),
                 penalty=DFA_COST_PED)
 
         # Assemble abstraction dict
@@ -497,10 +508,11 @@ def main():
             if opp_idx is not None:
                 vehicle_indices.append(opp_idx)
 
-            # Pedestrian lanelet (if visible)
+            # Pedestrian state (section × lateral band for VI lookup)
             ped_lanelet_idx = None
             ped_section = None
             ped_lane_id = None
+            ped_flat_state = None
             if env.pedestrian is not None:
                 ped_loc = env.pedestrian.get_location()
                 ped_dx = ped_loc.x - CENTRE[0]
@@ -511,6 +523,10 @@ def main():
                 ped_section = rmap._identify_section(
                     np.array([ped_loc.x, ped_loc.y]))
                 ped_lanelet_idx = graph.to_index(ped_section, ped_lane_id)
+                # 2-D pedestrian flat index for VI value lookup
+                ped_lat_idx = ped_lateral_from_radius(
+                    ped_r, INNER_RADIUS, N_LANES, LANE_WIDTH, N_P)
+                ped_flat_state = ped_flat_index(ped_section, ped_lat_idx, N_P)
 
             dfa_label = dfa.classify_joint_state(
                 vehicle_lanelet_indices=vehicle_indices,
@@ -528,6 +544,7 @@ def main():
             action_ego, action_opp = maker.get_action(
                 ego_lanelet=ego_idx,
                 opp_lanelet=opp_idx,
+                ped_state=ped_flat_state,
             )
 
             # -- 4b. Safety filter: accumulated horizon risk --
@@ -548,6 +565,30 @@ def main():
 
             pred_risk = SafetyFilter.predicted_horizon_risk(stage_costs, SF_GAMMA)
             risk_mode = SafetyFilter.select_mode(pred_risk, SF_SOFT_THRESH, SF_HARD_THRESH)
+
+            # If a lane change is chosen, also check the target lane
+            if action_ego in (_ACT_LANE_IN, _ACT_LANE_OUT):
+                target_lane = ego_lane - 1 if action_ego == _ACT_LANE_IN else ego_lane + 1
+                if 0 <= target_lane < N_LANES:
+                    lc_stage_costs = []
+                    for k in range(SF_HORIZON):
+                        future_sec = (sec_ego + k) % N_SECTIONS
+                        cost_k, _ = safety_filter.stage_risk_cost(
+                            ego_section=future_sec,
+                            ego_lane=target_lane,
+                            n_sections=N_SECTIONS,
+                            ped_section=ped_section if ped_lanelet_idx is not None else None,
+                            ped_lane=ped_lane_id if ped_lanelet_idx is not None else None,
+                            opp_section=sec_opp,
+                            opp_lane=opp_lane if opp_model is not None else None,
+                        )
+                        lc_stage_costs.append(cost_k)
+                    lc_risk = SafetyFilter.predicted_horizon_risk(lc_stage_costs, SF_GAMMA)
+                    lc_mode = SafetyFilter.select_mode(lc_risk, SF_SOFT_THRESH, SF_HARD_THRESH)
+                    # Use the worse of current-lane and target-lane risk
+                    if lc_mode.value > risk_mode.value:
+                        risk_mode = lc_mode
+                        pred_risk = max(pred_risk, lc_risk)
 
             # Override DP action based on risk mode
             v_cruise_ego = 10.0

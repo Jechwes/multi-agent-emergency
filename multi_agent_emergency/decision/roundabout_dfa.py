@@ -8,12 +8,12 @@ Temporal-logic specification
 ----------------------------
     ψ = G( ¬collision ∧ ¬non_drivable ∧ ¬pedestrian )
 
-The DFA has **two states**:
+The DFA has **two states** (co-safety formulation for risk minimisation):
 
-    q_safe (0) : accepting AND initial.  Normal driving.
-    q_fail (1) : absorbing failure state (sink).  Entered on collision,
+    q_safe (0) : initial, non-accepting.  Normal driving.
+    q_fail (1) : accepting AND absorbing (sink).  Entered on collision,
                  non-drivable violation, or pedestrian occupying the
-                 same cell.
+                 same cell.  Root of the DFA tree for risk computation.
 
 The safety filter prevents failures by accumulating risk over the
 look-ahead horizon.  Each hazard (pedestrian, non-drivable, other
@@ -37,8 +37,8 @@ Transition table ``trans[q, letter] → q'``:
     │ q_fail(1)│    1     │      1       │      1      │     1      │
     └──────────┴──────────┴──────────────┴─────────────┴────────────┘
 
-DFA.F    = 0   (accepting = initial = safe, root of the DFA tree)
-DFA.sink = 1   (absorbing failure)
+DFA.F    = 1   (accepting = failure, root of the DFA tree)
+DFA.sink = 1   (absorbing failure = accepting, co-safety formulation)
 
 Labelling function
 ------------------
@@ -98,7 +98,7 @@ class RoundaboutDFA:
         # q_safe = 0 : accepting + initial (normal driving)
         # q_fail = 1 : absorbing failure
         self.S  = [0, 1]
-        self.F  = 0              # accepting state  (root of the DFA tree)
+        self.F  = 1              # accepting state  (root of the DFA tree)
         self.sink = 1            # absorbing failure state
         self.S0 = 0              # initial state
 

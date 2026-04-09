@@ -320,78 +320,178 @@ def build_action_cost(
 # Pedestrian dimension
 # ---------------------------------------------------------------------------
 
-def _build_pedestrian_labels(
-    centres_p: np.ndarray,
-    lane_width: float,
-    n_lanes: int,
-    ref_lane: int,
-    n_letters: int = 4,
-) -> np.ndarray:
-    """Label matrix for pedestrian dimension.
-
-    When the pedestrian is on the reference (driving) lane, the label
-    is 'pedestrian' (col 2).  Otherwise 'safe' (col 0).
-    """
-    d_low = (ref_lane - n_lanes / 2.0) * lane_width
-    d_high = d_low + lane_width
-
-    L_p = np.zeros((n_letters, len(centres_p)), dtype=float)
-    for i, dp in enumerate(centres_p):
-        if d_low <= dp < d_high:
-            L_p[2, i] = 1.0   # pedestrian on driving lane
-        else:
-            L_p[0, i] = 1.0   # safe
-    return L_p
-
-
-def _build_pedestrian_cost(
-    centres_p: np.ndarray,
-    lane_width: float,
-    n_lanes: int,
-    ref_lane: int,
-    penalty: float = 50.0,
-) -> np.ndarray:
-    """State cost for pedestrian dimension (on reference lane)."""
-    d_low = (ref_lane - n_lanes / 2.0) * lane_width
-    d_high = d_low + lane_width
-    cost_p = np.zeros(len(centres_p), dtype=float)
-    for i, dp in enumerate(centres_p):
-        if d_low <= dp < d_high:
-            cost_p[i] = penalty
-    return cost_p
-
+# ---------------------------------------------------------------------------
+# Pedestrian dimension (section × lateral band)
+# ---------------------------------------------------------------------------
 
 def build_pedestrian_chain(
-    N_p: int,
+    N_lateral: int,
+    n_sections: int,
     lane_width: float,
     n_lanes: int = 4,
     p_move: float = 0.3,
+    ped_section: int = 0,
 ) -> Dict:
     """
-    Markov chain for pedestrian crossing inward from outer edge.
+    2-D Markov chain for a pedestrian at a fixed section crossing inward.
 
-    Returns dict with P_p, centres_p, rho_p.
+    The pedestrian state is (section, lateral_band) flattened as::
+
+        flat = section * N_lateral + lateral_band
+
+    The pedestrian does not move circumferentially, so the transition
+    matrix is block-diagonal: each section block is the 1-D lateral
+    chain (move inward with p_move, stay with 1 - p_move).
+
+    Parameters
+    ----------
+    N_lateral   : number of lateral discretisation cells.
+    n_sections  : number of roundabout sections.
+    lane_width  : radial width of each lane [m].
+    n_lanes     : total number of concentric lanes.
+    p_move      : probability of stepping one cell inward per tick.
+    ped_section : section where the pedestrian is located.
+
+    Returns
+    -------
+    dict with keys:
+        'P_p'        : (N_total, N_total) transition matrix
+        'centres_p'  : (N_lateral,) lateral cell centres [m]
+        'N_lateral'  : int
+        'n_sections' : int
+        'rho_p'      : (N_total,) initial distribution
+        'ped_section': int
     """
+    N_total = n_sections * N_lateral
     lateral_half = (n_lanes / 2.0) * lane_width
-    cell_w = 2.0 * lateral_half / N_p
+    cell_w = 2.0 * lateral_half / N_lateral
     centres_p = np.linspace(-lateral_half + cell_w / 2.0,
-                             lateral_half - cell_w / 2.0, N_p)
+                             lateral_half - cell_w / 2.0, N_lateral)
 
-    P_p = np.zeros((N_p, N_p), dtype=float)
-    for i in range(N_p):
+    # Build 1-D lateral chain
+    P_lat = np.zeros((N_lateral, N_lateral), dtype=float)
+    for i in range(N_lateral):
         if i > 0:
-            P_p[i, i - 1] = p_move
-            P_p[i, i]     = 1.0 - p_move
+            P_lat[i, i - 1] = p_move
+            P_lat[i, i]     = 1.0 - p_move
         else:
-            P_p[0, 0] = 1.0
+            P_lat[0, 0] = 1.0
 
-    rho_p = np.zeros(N_p, dtype=float)
+    # Block-diagonal: pedestrian stays in its section
+    P_p = np.zeros((N_total, N_total), dtype=float)
+    for sec in range(n_sections):
+        off = sec * N_lateral
+        P_p[off:off + N_lateral, off:off + N_lateral] = P_lat
+
+    # Initial distribution: outer cells at the pedestrian's section
+    rho_p = np.zeros(N_total, dtype=float)
     for i, dp in enumerate(centres_p):
         if dp >= lane_width:
-            rho_p[i] = 1.0
+            rho_p[ped_section * N_lateral + i] = 1.0
     if rho_p.sum() > 0:
         rho_p /= rho_p.sum()
     else:
-        rho_p[:] = 1.0 / N_p
+        rho_p[:] = 1.0 / N_total
 
-    return {'P_p': P_p, 'centres_p': centres_p, 'rho_p': rho_p}
+    return {
+        'P_p': P_p,
+        'centres_p': centres_p,
+        'N_lateral': N_lateral,
+        'n_sections': n_sections,
+        'rho_p': rho_p,
+        'ped_section': ped_section,
+    }
+
+
+def build_pedestrian_labels(
+    centres_p: np.ndarray,
+    n_sections: int,
+    lane_width: float,
+    n_lanes: int,
+    drivable_lanes: List[int],
+    n_letters: int = 4,
+) -> np.ndarray:
+    """
+    Label matrix for 2-D pedestrian dimension.
+
+    Shape: ``(n_letters, n_sections * N_lateral)``.
+
+    A pedestrian cell is labelled 'pedestrian' (letter 2) when it
+    overlaps any drivable lane, 'safe' (letter 0) otherwise.
+    """
+    N_lateral = len(centres_p)
+    N_total = n_sections * N_lateral
+
+    # Determine which lateral cells overlap a drivable lane
+    lateral_half = (n_lanes / 2.0) * lane_width
+    dangerous = np.zeros(N_lateral, dtype=bool)
+    for lane in drivable_lanes:
+        d_low = -lateral_half + lane * lane_width
+        d_high = d_low + lane_width
+        for i, dp in enumerate(centres_p):
+            if d_low <= dp < d_high:
+                dangerous[i] = True
+
+    L_p = np.zeros((n_letters, N_total), dtype=float)
+    for sec in range(n_sections):
+        for i in range(N_lateral):
+            flat = sec * N_lateral + i
+            if dangerous[i]:
+                L_p[2, flat] = 1.0   # pedestrian on a drivable lane
+            else:
+                L_p[0, flat] = 1.0   # safe
+    return L_p
+
+
+def build_pedestrian_cost(
+    centres_p: np.ndarray,
+    n_sections: int,
+    lane_width: float,
+    n_lanes: int,
+    drivable_lanes: List[int],
+    penalty: float = 500.0,
+) -> np.ndarray:
+    """
+    State cost for 2-D pedestrian dimension.
+
+    Shape: ``(n_sections * N_lateral,)``.  Penalty is applied to cells
+    where the pedestrian overlaps any drivable lane.
+    """
+    N_lateral = len(centres_p)
+    N_total = n_sections * N_lateral
+
+    lateral_half = (n_lanes / 2.0) * lane_width
+    dangerous = np.zeros(N_lateral, dtype=bool)
+    for lane in drivable_lanes:
+        d_low = -lateral_half + lane * lane_width
+        d_high = d_low + lane_width
+        for i, dp in enumerate(centres_p):
+            if d_low <= dp < d_high:
+                dangerous[i] = True
+
+    cost_p = np.zeros(N_total, dtype=float)
+    for sec in range(n_sections):
+        for i in range(N_lateral):
+            if dangerous[i]:
+                cost_p[sec * N_lateral + i] = penalty
+    return cost_p
+
+
+def ped_flat_index(section: int, lateral_idx: int, N_lateral: int) -> int:
+    """Convert (section, lateral_band) to flat pedestrian state index."""
+    return section * N_lateral + lateral_idx
+
+
+def ped_lateral_from_radius(
+    ped_r: float,
+    inner_radius: float,
+    n_lanes: int,
+    lane_width: float,
+    N_lateral: int,
+) -> int:
+    """Map a pedestrian's radial distance to its lateral cell index."""
+    lateral_half = (n_lanes / 2.0) * lane_width
+    d = ped_r - (inner_radius + lateral_half)  # deviation from centre
+    cell_w = 2.0 * lateral_half / N_lateral
+    idx = int((d + lateral_half) / cell_w)
+    return max(0, min(N_lateral - 1, idx))

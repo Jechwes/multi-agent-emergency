@@ -146,7 +146,7 @@ class RoundaboutDPDecisionMaker:
         # -- optional: pedestrian dimension (uncontrolled) --
         if self.has_pedestrian:
             ped = abs_data['ped_data']
-            N_p = len(ped['centres_p'])
+            N_p = ped['n_sections'] * ped['N_lateral']
             sysAbs.append(SysAbs1D(ped['P_p']))
             nx_list.append(N_p)
             L.append(abs_data['L_p'])
@@ -201,15 +201,22 @@ class RoundaboutDPDecisionMaker:
         self,
         ego_lanelet: int,
         opp_lanelet: Optional[int] = None,
+        ped_state: Optional[int] = None,
     ) -> Tuple[int, Optional[int]]:
         """
         Look up the offline policy at the current lanelet indices.
+
+        When a pedestrian state is provided and the pedestrian dimension
+        exists, the ego action is selected via online one-step lookahead
+        over the factored value function, making it pedestrian-state-
+        dependent without breaking the rank-1 factorisation.
 
         Parameters
         ----------
         ego_lanelet : flat lanelet index of ego vehicle.
         opp_lanelet : flat lanelet index of opponent vehicle, or ``None``
                       in single-agent mode.
+        ped_state   : flat pedestrian state index, or ``None``.
 
         Returns
         -------
@@ -219,12 +226,14 @@ class RoundaboutDPDecisionMaker:
         """
         q = self.q_current
         if q == int(self.dfa.sink):
-            # In the failure state, yield for all vehicles
             yield_action = 3
             return yield_action, (yield_action if self.has_opponent else None)
 
-        # -- ego action --
-        action_ego = self._lookup_action(q, self.dim_ego, ego_lanelet)
+        # -- ego action: online lookahead when pedestrian state is known --
+        if self.has_pedestrian and ped_state is not None:
+            action_ego = self._lookahead_action(q, ego_lanelet, ped_state)
+        else:
+            action_ego = self._lookup_action(q, self.dim_ego, ego_lanelet)
 
         # -- opponent action (if present) --
         action_opp: Optional[int] = None
@@ -232,6 +241,53 @@ class RoundaboutDPDecisionMaker:
             action_opp = self._lookup_action(q, self.dim_opp, opp_lanelet)
 
         return action_ego, action_opp
+
+    def _lookahead_action(
+        self, q: int, ego_lanelet: int, ped_state: int,
+    ) -> int:
+        """
+        Online one-step lookahead using the factored value function.
+
+        For each candidate action *a*, compute the expected joint value
+        over the transition distribution and the current pedestrian state:
+
+            Q(a) = action_cost[a] + Σ_n ( p_next · v_ego[n] ) · v_ped[n, s_ped]
+
+        This makes the ego action pedestrian-state-dependent while
+        reusing the rank-1 factors computed offline.
+        """
+        nodes = self.tree.Q.get(q, [])
+        if not nodes:
+            return 3  # yield fallback
+
+        P_ego = self.abs_data['P_ego']
+        N = self.n_lanelets
+        n_actions = P_ego.shape[1] // N
+        action_cost = self.abs_data['action_cost_ego']
+
+        # Pre-fetch value factors for all relevant nodes
+        V_ego = np.asarray(self.tree.V[self.dim_ego], dtype=float)  # (n_nodes, N)
+        V_ped = np.asarray(self.tree.V[self.dim_ped], dtype=float)  # (n_nodes, N_ped)
+
+        best_action = 3
+        best_cost = float('inf')
+
+        for a in range(n_actions):
+            # Transition distribution over next ego states for action a
+            p_next = P_ego[ego_lanelet, a * N : (a + 1) * N]
+
+            # Σ_n (p_next · v_ego[n, :]) * v_ped[n, ped_state]
+            value = 0.0
+            for n in nodes:
+                expected_ego = float(np.dot(p_next, V_ego[n, :]))
+                value += expected_ego * float(V_ped[n, ped_state])
+
+            cost = float(action_cost[a]) + value
+            if cost < best_cost:
+                best_cost = cost
+                best_action = a
+
+        return best_action
 
     def _lookup_action(self, q: int, dim: int, lanelet_idx: int) -> int:
         """Extract the greedy action from tree.pol[q][dim] at lanelet_idx."""

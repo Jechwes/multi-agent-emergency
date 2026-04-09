@@ -218,11 +218,15 @@ class DFATree:
         self.tree = nx.DiGraph()
         self.tree.add_node(0, q=F)
 
-        # Add all predecessors of F as children of root
+        # Add all predecessors of F as children of root, skipping
+        # sink-state self-loops (they are absorbing and never computed).
         S_rows, L_cols = np.where(trans == F)  # 0-based (sources s, letters l)
+        sink = int(self.DFA.sink) if hasattr(self.DFA, "sink") and self.DFA.sink is not None else None
         nid = 1
         self.leafs = []
         for s, l in zip(S_rows, L_cols):
+            if sink is not None and int(s) == sink and F == sink:
+                continue  # skip sink self-loops
             self.tree.add_node(nid, q=int(s))
             self.tree.add_edge(0, nid, l=int(l))  # store label as 0-based column index
             self.leafs.append(nid)
@@ -233,7 +237,7 @@ class DFATree:
         for d in range(self.dim):
             self.V[d] = np.zeros((n_nodes, self.nx[d]), dtype=float)
             #self.V[d][0, :] = 1.0
-            self.V[d][0, :] = 0.0 # CHANGED TO 0.0 FOR RISK MINIMALIZATION
+            self.V[d][0, :] = 1.0 # root = failure (co-safety DFA) = maximum risk
 
         # Build Q-mapping
         self.Q = {int(q): [] for q in self.DFA.S}
@@ -271,7 +275,13 @@ class DFATree:
         if n not in self.leafs:
             raise ValueError("node is not a leaf node")
 
+        # Skip expanding sink-state leaves — they are absorbing and
+        # their values are never computed, so growing them only wastes memory.
         q1 = self.Lq(n)
+        if hasattr(self.DFA, "sink") and getattr(self.DFA, "sink") is not None:
+            if q1 == int(self.DFA.sink):
+                self.leafs.remove(n)
+                return
         trans = np.asarray(self.DFA.trans, dtype=int)
 
         # All predecessors of q1: pairs (s, l) with trans[s,l] == q1
@@ -334,10 +344,7 @@ class DFATree:
             mask_row = mask.reshape(1, -1)  # (1, N)
 
             cost_d = self.cost_map[d].reshape(1, -1) # (1, Nd)
-            v_with_cost = v_parent_row + cost_d  # c(s') + V_parent(s')
-
-            # elemul = v_parent_row * mask_row
-            elemul = mask_row * (self.gamma * v_with_cost)  # gamma * L_a * (c+ V)
+            elemul = self.gamma * (cost_d + mask_row * v_parent_row)
 
             # naive computation, one line, works for 1d case:
             # vx = elemul @ self.Pxx[q][d]
@@ -428,22 +435,19 @@ class DFATree:
             mask_row = np.asarray(self.L[d][l, :], dtype=float).reshape(1, -1)
             v_parent_row = np.asarray(self.V[d][nparent, :], dtype=float).reshape(1, -1)
             cost_d = np.asarray(self.cost_map[d]).reshape(1, -1)
-            v_with_cost = v_parent_row + cost_d
-            w = mask_row * (self.gamma * v_with_cost)  # (1, N)
+            w = self.gamma * (cost_d + mask_row * v_parent_row)  # (1, N)
 
             if self.sysAbs[d].dim == 1:
                 P_flat = P_attr  # (N, N*nu)
                 nu = P_flat.shape[1] // N
                 prod = np.asfortranarray(w) @ P_flat  # (1, N*nu)
                 Qv_d = np.reshape(prod, (N, nu), order='F')
-                # Qv_d *= zeta
                 Qv.append(Qv_d)
 
             elif self.sysAbs[d].dim == 2:
                 nu = P_attr.a
                 prod = np.asfortranarray(w) @ P_attr.stoch
                 Qv_d = np.reshape(prod, (N, nu), order='F')
-                # Qv_d *= zeta
                 Qv.append(Qv_d)
 
             else:
@@ -480,27 +484,20 @@ class DFATree:
             # P_flat = np.asarray(getattr(self.sysAbs[d], "P"), dtype=float, order='F')
 
             P_attr = getattr(self.sysAbs[d], "P", None)
+            mask_row = np.asarray(self.L[d][l, :], dtype=float).reshape(1, -1)
+            v_parent_row = np.asarray(self.V[d][nparent, :], dtype=float).reshape(1, -1)
+            cost_d = np.asarray(self.cost_map[d]).reshape(1, -1)
+            w = self.gamma * (cost_d + mask_row * v_parent_row)
+
             if self.sysAbs[d].dim == 1:
                 P_flat = P_attr
                 nu = P_flat.shape[1] // N
-                mask_row = np.asarray(self.L[d][l, :], dtype=float).reshape(1, -1)
-                v_parent_row = np.asarray(self.V[d][nparent, :], dtype=float).reshape(1, -1)
-                cost_d = np.asarray(self.cost_map[d]).reshape(1, -1)
-                v_with_cost = v_parent_row + cost_d
-                w = mask_row * (self.gamma * v_with_cost)
                 prod = np.asfortranarray(w) @ P_flat
                 Qv_d = np.reshape(prod, (N, nu), order='F')
-                # Qv_d = np.maximum(Qv_d - 0.001, 0.0)
                 Qv.append(Qv_d)
 
             elif self.sysAbs[d].dim == 2:
                 nu = P_attr.a
-                mask_row = np.asarray(self.L[d][l, :], dtype=float).reshape(1, -1)
-                v_parent_row = np.asarray(self.V[d][nparent, :], dtype=float).reshape(1, -1)
-                cost_d = np.asarray(self.cost_map[d]).reshape(1, -1)
-                v_with_cost = v_parent_row + cost_d
-                w = mask_row * (self.gamma * v_with_cost)
-                # EQUIVALENCE: prod = P_attr.mtimes( np.asfortranarray(w)  )
                 prod = np.asfortranarray(w) @ P_attr.stoch
                 Qv_d = np.reshape(prod, (N, nu), order='F')
                 Qv.append(Qv_d)
