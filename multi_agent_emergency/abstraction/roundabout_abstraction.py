@@ -235,7 +235,7 @@ class LaneletGraph:
 
 def build_label_matrix(
     graph: LaneletGraph,
-    n_letters: int = 4,
+    n_letters: int = 2,
 ) -> np.ndarray:
     """
     Build a label indicator matrix for a single vehicle dimension.
@@ -243,26 +243,19 @@ def build_label_matrix(
     Shape: ``(n_letters, N_lanelets)``.  Each column encodes which
     atomic proposition holds at that lanelet.
 
-    Alphabet
-    --------
-    0 - 'drivable'      lanelet whose lane ∈ drivable_lanes
-    1 - 'non_drivable'  lanelet whose lane ∉ drivable_lanes
-    2 - 'pedestrian'    (unused here — set by pedestrian dimension)
-    3 - 'collision'     (unused here — emerges from joint label
-                         when two vehicles share a lanelet)
-
-    Collision detection is not encoded per-vehicle; it arises in the
-    product automaton when the DFA observes the combined label across
-    all vehicle dimensions.
+    Alphabet (2 letters)
+    --------------------
+    0 - 'safe'  : lanelet whose lane ∈ drivable_lanes
+    1 - 'nd'    : lanelet whose lane ∉ drivable_lanes
     """
     N = graph.n_lanelets
     L = np.zeros((n_letters, N), dtype=float)
 
     for idx in range(N):
         if graph.is_lanelet_drivable(idx):
-            L[0, idx] = 1.0   # drivable
+            L[0, idx] = 1.0   # safe
         else:
-            L[1, idx] = 1.0   # non_drivable
+            L[1, idx] = 1.0   # nd
 
     return L
 

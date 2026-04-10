@@ -90,7 +90,7 @@ class SafetyFilter:
         """
         # Non-drivable lane
         if ego_lane not in self.drivable_lanes:
-            return float(self.dfa.get_risk_cost('non_drivable')), 'non_drivable'
+            return float(self.dfa.get_risk_cost('nd')), 'nd'
 
         # Pedestrian occupies same section
         if (
@@ -110,7 +110,7 @@ class SafetyFilter:
         ):
             return float(self.dfa.get_risk_cost('collision')), 'collision'
 
-        return 0.0, 'drivable'
+        return 0.0, 'safe'
 
     # ------------------------------------------------------------------
     # Accumulated horizon risk

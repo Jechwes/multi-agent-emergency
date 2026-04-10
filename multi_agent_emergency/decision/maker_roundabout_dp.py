@@ -4,16 +4,18 @@ maker_roundabout_dp.py
 Offline DP decision maker for the roundabout scenario using DFATree-based
 risk-minimising value iteration (``dfa_tree_r1_risk_min.py``).
 
-Single-tree architecture
-------------------------
-One DFATree is built offline at startup over all agent dimensions:
+Single-dimension architecture
+------------------------------
+The DFATree is built offline over a **single dimension** (the ego
+vehicle's lanelet graph) to enforce G(¬nd) — avoiding non-drivable
+areas.
 
-  - ego vehicle      : lanelet-graph transition matrix, controlled
-  - opponent vehicle : lanelet-graph transition matrix, controlled
-  - pedestrian       : Markov chain, uncontrolled
+Since all vehicles share the same lanelet graph and the nd predicate
+is per-dimension, the same policy is reused for the opponent vehicle.
 
-For single-agent mode (no opponent), only the ego + pedestrian
-dimensions are included.
+Pedestrian avoidance and inter-vehicle collision avoidance are
+cross-dimensional predicates that cannot be rank-1 decomposed.  They
+are handled entirely by the online safety filter.
 
 Online, ``get_action(...)`` returns a discrete action index per
 controlled vehicle by looking up the offline policy at the current
@@ -44,22 +46,18 @@ class RoundaboutDPDecisionMaker:
     """
     Offline DP solver + online policy lookup.
 
-    Builds ONE DFATree offline over all agent dimensions, then provides:
-      - ``get_action(...)``  → discrete action index per controlled vehicle
-      - ``get_value(...)``   → factored risk value at the current joint state
+    Builds a single-dimension DFATree offline (ego vehicle only) to
+    enforce G(¬nd).  The same policy is reused for the opponent.
 
     Parameters
     ----------
     dfa           : RoundaboutDFA instance
-    abs_data      : dict with keys produced by the new lanelet-graph
-                    abstraction builders:
-                      'P_ego', 'P_opp'       : transition matrices (optional opp)
-                      'L_ego', 'L_opp'       : label matrices
-                      'state_cost_ego/opp'   : state cost vectors
-                      'action_cost_ego/opp'  : action cost vectors
-                      'n_lanelets'           : number of lanelets
-                      'ped_data'             : dict with P_p, centres_p, rho_p (optional)
-                      'L_p', 'cost_p'        : pedestrian labels/cost (optional)
+    abs_data      : dict with keys:
+                      'P_ego'              : transition matrix
+                      'L_ego'              : label matrix (2 letters)
+                      'state_cost_ego'     : state cost vector
+                      'action_cost_ego'    : action cost vector
+                      'n_lanelets'         : number of lanelets
     gamma         : discount factor
     n_tree_iters, n_vi_per_iter, n_grow : DFATree solver parameters
     """
@@ -78,23 +76,8 @@ class RoundaboutDPDecisionMaker:
         self.gamma = gamma
 
         self.n_lanelets = abs_data['n_lanelets']
-        self.has_opponent = 'P_opp' in abs_data
-        self.has_pedestrian = (abs_data.get('ped_data') is not None
-                               and abs_data.get('L_p') is not None)
 
-        # Dimension index bookkeeping
-        self.dim_ego = 0
-        self.dim_opp: Optional[int] = None
-        self.dim_ped: Optional[int] = None
-
-        next_dim = 1
-        if self.has_opponent:
-            self.dim_opp = next_dim
-            next_dim += 1
-        if self.has_pedestrian:
-            self.dim_ped = next_dim
-
-        # Build the single DFATree (offline)
+        # Build the single-dimension DFATree (offline)
         print("[DP] Building tree...")
         self.tree = self._build_tree(
             abs_data, n_tree_iters, n_vi_per_iter, n_grow
@@ -115,18 +98,13 @@ class RoundaboutDPDecisionMaker:
         n_grow: int,
     ) -> DFATree:
         """
-        Assemble dimensions and solve a single DFATree.
+        Build and solve a single-dimension DFATree (ego vehicle only).
 
-        Dimensions are added in order:
-          0 : ego vehicle      (controlled)
-          1 : opponent vehicle (controlled, only if present)
-          ? : pedestrian       (uncontrolled, only if present)
-
-        Single-agent mode omits the opponent dimension entirely.
+        The tree enforces G(¬nd) over the ego vehicle's lanelet graph.
+        The same policy is reused for the opponent vehicle online.
         """
         N = self.n_lanelets
 
-        # -- always: ego dimension --
         sysAbs = [SysAbs1D(abs_data['P_ego'])]
         nx_list = [N]
         L = [abs_data['L_ego']]
@@ -134,33 +112,11 @@ class RoundaboutDPDecisionMaker:
         action_cost_list = [abs_data['action_cost_ego']]
         rho = [np.ones(N, dtype=float) / N]
 
-        # -- optional: opponent dimension --
-        if self.has_opponent:
-            sysAbs.append(SysAbs1D(abs_data['P_opp']))
-            nx_list.append(N)
-            L.append(abs_data['L_opp'])
-            cost_map.append(abs_data['state_cost_opp'])
-            action_cost_list.append(abs_data['action_cost_opp'])
-            rho.append(np.ones(N, dtype=float) / N)
-
-        # -- optional: pedestrian dimension (uncontrolled) --
-        if self.has_pedestrian:
-            ped = abs_data['ped_data']
-            N_p = ped['n_sections'] * ped['N_lateral']
-            sysAbs.append(SysAbs1D(ped['P_p']))
-            nx_list.append(N_p)
-            L.append(abs_data['L_p'])
-            cost_map.append(abs_data['cost_p'])
-            action_cost_list.append(None)   # uncontrolled
-            rho.append(ped['rho_p'])
-
-        # -- initialise policy array --
-        n_dims = len(sysAbs)
+        # Single dimension: policy array is (n_dfa_states, 1)
         n_dfa_states = self.dfa.n_states
-        pol_init = np.empty((n_dfa_states, n_dims), dtype=object)
+        pol_init = np.empty((n_dfa_states, 1), dtype=object)
         for q in range(n_dfa_states):
-            for dim in range(n_dims):
-                pol_init[q][dim] = None
+            pol_init[q][0] = None
 
         tree = DFATree(
             DFA=self.dfa,
@@ -179,7 +135,7 @@ class RoundaboutDPDecisionMaker:
         tree.action_cost = action_cost_list
         tree.initiate()
 
-        print(f"[DP] Solving DFATree (dims={n_dims}, "
+        print(f"[DP] Solving DFATree (dims=1, "
               f"iters={n_tree_iters}, vi={n_vi_per_iter}, grow={n_grow})...")
 
         for it in range(n_tree_iters):
@@ -201,22 +157,18 @@ class RoundaboutDPDecisionMaker:
         self,
         ego_lanelet: int,
         opp_lanelet: Optional[int] = None,
-        ped_state: Optional[int] = None,
     ) -> Tuple[int, Optional[int]]:
         """
         Look up the offline policy at the current lanelet indices.
 
-        When a pedestrian state is provided and the pedestrian dimension
-        exists, the ego action is selected via online one-step lookahead
-        over the factored value function, making it pedestrian-state-
-        dependent without breaking the rank-1 factorisation.
+        The same single-dimension policy (nd-avoidance) is used for
+        both ego and opponent vehicles.
 
         Parameters
         ----------
         ego_lanelet : flat lanelet index of ego vehicle.
         opp_lanelet : flat lanelet index of opponent vehicle, or ``None``
                       in single-agent mode.
-        ped_state   : flat pedestrian state index, or ``None``.
 
         Returns
         -------
@@ -227,80 +179,29 @@ class RoundaboutDPDecisionMaker:
         q = self.q_current
         if q == int(self.dfa.sink):
             yield_action = 3
-            return yield_action, (yield_action if self.has_opponent else None)
+            return yield_action, (yield_action if opp_lanelet is not None else None)
 
-        # -- ego action: online lookahead when pedestrian state is known --
-        if self.has_pedestrian and ped_state is not None:
-            action_ego = self._lookahead_action(q, ego_lanelet, ped_state)
-        else:
-            action_ego = self._lookup_action(q, self.dim_ego, ego_lanelet)
+        action_ego = self._lookup_action(q, ego_lanelet)
 
-        # -- opponent action (if present) --
         action_opp: Optional[int] = None
-        if self.has_opponent and opp_lanelet is not None:
-            action_opp = self._lookup_action(q, self.dim_opp, opp_lanelet)
+        if opp_lanelet is not None:
+            action_opp = self._lookup_action(q, opp_lanelet)
 
         return action_ego, action_opp
 
-    def _lookahead_action(
-        self, q: int, ego_lanelet: int, ped_state: int,
-    ) -> int:
-        """
-        Online one-step lookahead using the factored value function.
-
-        For each candidate action *a*, compute the expected joint value
-        over the transition distribution and the current pedestrian state:
-
-            Q(a) = action_cost[a] + Σ_n ( p_next · v_ego[n] ) · v_ped[n, s_ped]
-
-        This makes the ego action pedestrian-state-dependent while
-        reusing the rank-1 factors computed offline.
-        """
-        nodes = self.tree.Q.get(q, [])
-        if not nodes:
-            return 3  # yield fallback
-
-        P_ego = self.abs_data['P_ego']
-        N = self.n_lanelets
-        n_actions = P_ego.shape[1] // N
-        action_cost = self.abs_data['action_cost_ego']
-
-        # Pre-fetch value factors for all relevant nodes
-        V_ego = np.asarray(self.tree.V[self.dim_ego], dtype=float)  # (n_nodes, N)
-        V_ped = np.asarray(self.tree.V[self.dim_ped], dtype=float)  # (n_nodes, N_ped)
-
-        best_action = 3
-        best_cost = float('inf')
-
-        for a in range(n_actions):
-            # Transition distribution over next ego states for action a
-            p_next = P_ego[ego_lanelet, a * N : (a + 1) * N]
-
-            # Σ_n (p_next · v_ego[n, :]) * v_ped[n, ped_state]
-            value = 0.0
-            for n in nodes:
-                expected_ego = float(np.dot(p_next, V_ego[n, :]))
-                value += expected_ego * float(V_ped[n, ped_state])
-
-            cost = float(action_cost[a]) + value
-            if cost < best_cost:
-                best_cost = cost
-                best_action = a
-
-        return best_action
-
-    def _lookup_action(self, q: int, dim: int, lanelet_idx: int) -> int:
-        """Extract the greedy action from tree.pol[q][dim] at lanelet_idx."""
-        pol = self.tree.pol[q][dim]
+    def _lookup_action(self, q: int, lanelet_idx: int) -> int:
+        """Extract the greedy action from tree.pol[q][0] at lanelet_idx."""
+        pol = self.tree.pol[q][0]
         if pol is None:
             return 3  # yield as fallback if policy not computed
         if hasattr(pol, 'toarray'):
             pol = pol.toarray()
-        
+
         if lanelet_idx < 0 or lanelet_idx >= pol.shape[0]:
-            print(f"[Warning] Lanelet index {lanelet_idx} out of bounds for policy shape {pol.shape}. Falling back to yield.")
+            print(f"[Warning] Lanelet index {lanelet_idx} out of bounds "
+                  f"for policy shape {pol.shape}. Falling back to yield.")
             return 3
-            
+
         return int(np.argmax(pol[lanelet_idx, :]))
 
     # ------------------------------------------------------------------
@@ -309,21 +210,17 @@ class RoundaboutDPDecisionMaker:
 
     def get_value(
         self,
-        ego_lanelet: int,
-        opp_lanelet: Optional[int] = None,
-        ped_state: Optional[int] = None,
+        lanelet_idx: int,
     ) -> float:
         """
-        Factored risk value at the current joint state.
+        Risk value at a lanelet index from the single-dimension tree.
 
-        Computes  Σ_n  ∏_d  V[d][n, idx_d]  over tree nodes and all
-        active dimensions (ego × opponent × pedestrian).
+        Computes  Σ_n  V[0][n, lanelet_idx]  over tree nodes for the
+        current DFA mode.
 
         Parameters
         ----------
-        ego_lanelet : flat lanelet index of ego vehicle.
-        opp_lanelet : flat lanelet index of opponent, or ``None``.
-        ped_state   : pedestrian grid index, or ``None``.
+        lanelet_idx : flat lanelet index.
 
         Returns
         -------
@@ -333,21 +230,9 @@ class RoundaboutDPDecisionMaker:
         if q == int(self.dfa.sink):
             return float('inf')
 
-        # Build list of (dimension_index, state_index) pairs
-        dims_and_indices: List[Tuple[int, int]] = [(self.dim_ego, ego_lanelet)]
-
-        if self.has_opponent and opp_lanelet is not None:
-            dims_and_indices.append((self.dim_opp, opp_lanelet))
-
-        if self.has_pedestrian and ped_state is not None:
-            dims_and_indices.append((self.dim_ped, ped_state))
-
         total = 0.0
         for n in self.tree.Q.get(q, []):
-            product = 1.0
-            for dim, idx in dims_and_indices:
-                product *= float(self.tree.V[dim][n, idx])
-            total += product
+            total += float(self.tree.V[0][n, lanelet_idx])
         return total
 
     # ------------------------------------------------------------------

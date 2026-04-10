@@ -48,11 +48,6 @@ from abstraction.roundabout_abstraction import (
     build_label_matrix,
     build_state_cost,
     build_action_cost,
-    build_pedestrian_chain,
-    build_pedestrian_labels,
-    build_pedestrian_cost,
-    ped_flat_index,
-    ped_lateral_from_radius,
 )
 
 from decision.roundabout_dfa import RoundaboutDFA
@@ -349,51 +344,19 @@ def main():
         # Transition matrix (identical dynamics for all vehicles)
         P_vehicle = graph.build_transition_matrix(process_noise=PROCESS_NOISE)
 
-        # Labels and costs
-        L_vehicle = build_label_matrix(graph, n_letters=4)
+        # Labels and costs (2-letter DFA: safe / nd)
+        L_vehicle = build_label_matrix(graph, n_letters=2)
         state_cost_ego = build_state_cost(graph, NON_DRIVABLE_PENALTY_EGO)
         action_cost_ego = build_action_cost(ADVANCE_REWARD, LANE_CHANGE_COST)
 
-        # Pedestrian chain (2-D: section × lateral band)
-        ped_data = None
-        L_p = None
-        cost_p = None
-        if N_P >= 2:
-            ped_data = build_pedestrian_chain(
-                N_lateral=N_P,
-                n_sections=N_SECTIONS,
-                lane_width=LANE_WIDTH,
-                n_lanes=N_LANES,
-                p_move=P_MOVE,
-                ped_section=PED_SECTION,
-            )
-            L_p = build_pedestrian_labels(
-                ped_data['centres_p'], N_SECTIONS, LANE_WIDTH,
-                N_LANES, list(DRIVABLE_LANES))
-            cost_p = build_pedestrian_cost(
-                ped_data['centres_p'], N_SECTIONS, LANE_WIDTH,
-                N_LANES, list(DRIVABLE_LANES),
-                penalty=DFA_COST_PED)
-
-        # Assemble abstraction dict
+        # Assemble abstraction dict (ego only — single-dimension offline)
         abs_data = {
             'n_lanelets':       graph.n_lanelets,
             'P_ego':            P_vehicle,
             'L_ego':            L_vehicle,
             'state_cost_ego':   state_cost_ego,
             'action_cost_ego':  action_cost_ego,
-            'ped_data':         ped_data,
-            'L_p':              L_p,
-            'cost_p':           cost_p,
         }
-
-        if multi_agent:
-            state_cost_opp = build_state_cost(graph, NON_DRIVABLE_PENALTY_OPP)
-            action_cost_opp = build_action_cost(ADVANCE_REWARD, LANE_CHANGE_COST)
-            abs_data['P_opp']           = P_vehicle
-            abs_data['L_opp']           = L_vehicle
-            abs_data['state_cost_opp']  = state_cost_opp
-            abs_data['action_cost_opp'] = action_cost_opp
 
         # DFA
         dfa = RoundaboutDFA(
@@ -512,7 +475,6 @@ def main():
             ped_lanelet_idx = None
             ped_section = None
             ped_lane_id = None
-            ped_flat_state = None
             if env.pedestrian is not None:
                 ped_loc = env.pedestrian.get_location()
                 ped_dx = ped_loc.x - CENTRE[0]
@@ -523,10 +485,6 @@ def main():
                 ped_section = rmap._identify_section(
                     np.array([ped_loc.x, ped_loc.y]))
                 ped_lanelet_idx = graph.to_index(ped_section, ped_lane_id)
-                # 2-D pedestrian flat index for VI value lookup
-                ped_lat_idx = ped_lateral_from_radius(
-                    ped_r, INNER_RADIUS, N_LANES, LANE_WIDTH, N_P)
-                ped_flat_state = ped_flat_index(ped_section, ped_lat_idx, N_P)
 
             dfa_label = dfa.classify_joint_state(
                 vehicle_lanelet_indices=vehicle_indices,
@@ -544,7 +502,6 @@ def main():
             action_ego, action_opp = maker.get_action(
                 ego_lanelet=ego_idx,
                 opp_lanelet=opp_idx,
-                ped_state=ped_flat_state,
             )
 
             # -- 4b. Safety filter: accumulated horizon risk --
