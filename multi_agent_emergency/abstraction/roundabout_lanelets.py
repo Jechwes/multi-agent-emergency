@@ -564,19 +564,19 @@ class RoundaboutLaneletMap:
                     for i in range(len(pts) - 1):
                         _draw_line(pts[i], pts[i + 1], colour, thick=0.04)
 
-                # Lane boundaries (only draw outer boundary for outermost,
-                # inner for innermost, to avoid overlap)
+                # Lane boundaries: draw the inner edge of every lane (this
+                # covers the innermost circle plus every shared edge between
+                # adjacent lanes), then draw the outer edge of the outermost
+                # lane to close off the ring. This yields n_lanes+1 distinct
+                # circles with no overlap.
                 if draw_lane_boundaries:
                     inner_pts, outer_pts = sl.boundary_points(n_samples)
-                    boundary_colour = (255, 165, 0)  # orange
+                    boundary_colour = (0, 255, 0)  # orange
 
-                    if lane_id == 0:
-                        # Inner boundary of innermost lane
-                        for i in range(len(inner_pts) - 1):
-                            _draw_line(inner_pts[i], inner_pts[i + 1],
-                                       boundary_colour, thick=0.05)
+                    for i in range(len(inner_pts) - 1):
+                        _draw_line(inner_pts[i], inner_pts[i + 1],
+                                   boundary_colour, thick=0.05)
                     if lane_id == self.n_lanes - 1:
-                        # Outer boundary of outermost lane
                         for i in range(len(outer_pts) - 1):
                             _draw_line(outer_pts[i], outer_pts[i + 1],
                                        boundary_colour, thick=0.05)
@@ -593,7 +593,7 @@ class RoundaboutLaneletMap:
                         n = np.array([-math.sin(heading), math.cos(heading)])
                         c = np.array([cx, cy])
                         _draw_line(c - half_w * n, c + half_w * n,
-                                   (0, 180, 255), thick=0.03)
+                                   (0, 255, 0), thick=0.03)
 
         # --- Draw section boundaries (radial lines) ---
         if draw_section_boundaries:
@@ -604,7 +604,7 @@ class RoundaboutLaneletMap:
                 angle = sign * sec * self.section_angle
                 p_in = self.centre + r_inner * np.array([math.cos(angle), math.sin(angle)])
                 p_out = self.centre + r_outer * np.array([math.cos(angle), math.sin(angle)])
-                _draw_line(p_in, p_out, (255, 80, 80), thick=0.08)
+                _draw_line(p_in, p_out, (0, 255, 0), thick=0.05)
 
         # --- Draw section index labels ---
         if draw_section_labels:

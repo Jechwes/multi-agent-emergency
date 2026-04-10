@@ -327,7 +327,7 @@ def main():
         MPC_DT      = ego_controller.dt
         MPC_HORIZON = ego_controller.horizon
 
-        rmap.draw_in_carla(env.world, z=0.2, life_time=120.0,
+        rmap.draw_in_carla(env.world, z=0.2, life_time=120.0, draw_centrelines=False,
                            draw_s_grid=False, draw_section_labels=True)
 
         # =================================================================
@@ -377,7 +377,7 @@ def main():
         )
 
         # =================================================================
-        #  4b. SAFETY FILTER (online risk override)
+        #  5. ONLINE: SAFETY FILTER
         # =================================================================
         safety_filter = SafetyFilter(
             dfa=dfa,
@@ -388,7 +388,7 @@ def main():
         )
 
         # =================================================================
-        #  5. MAIN SIMULATION LOOP
+        #  6. ONLINE: MAIN SIMULATION LOOP
         # =================================================================
         print("\n========== Starting simulation loop ==========\n")
         step = 0

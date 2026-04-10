@@ -10,8 +10,8 @@ The script:
 1. Connects to a running CARLA server and loads Town03 (the roundabout map).
 2. Moves the spectator camera directly above the roundabout.
 3. Builds a ``RoundaboutLaneletMap`` with the configured geometry.
-4. Draws all section boundaries, lane centre-lines, lane edges, and
-   longitudinal grid lines within each section using CARLA debug lines.
+4. Draws all section boundaries, lane edges, and longitudinal grid
+   lines within each section using CARLA debug lines.
 5. Keeps the simulation ticking so the visualisation stays visible.
 
 Press Ctrl+C to exit.
@@ -95,7 +95,7 @@ def main():
         life_time=args.life_time,
         draw_section_boundaries=True,
         draw_lane_boundaries=True,
-        draw_centrelines=True,
+        draw_centrelines=False,
         draw_s_grid=(args.s_grid is not None),
         draw_section_labels=True,
     )
